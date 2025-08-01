@@ -153,7 +153,7 @@ if __name__ == '__main__':
     assert ret, 'Error when reading the first frame (try different --input?)'
 
     frame_tensor = frame2tensor(frame, device)
-    last_data = matching.superpoint({'image': frame_tensor})
+    last_data = matching.superpoint({'image': frame_tensor}, masks=None)
     last_data = {k+'0': last_data[k] for k in keys}
     last_data['image0'] = frame_tensor
     last_frame = frame

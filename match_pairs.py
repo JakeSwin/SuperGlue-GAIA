@@ -57,13 +57,19 @@ import seaborn as sns
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 
+from torch.utils.data import DataLoader
+from ultralytics.models import sam
+
 from models.matching import Matching
 from models.utils import (compute_pose_error, compute_epipolar_error,
                           estimate_pose, estimate_pose_3d, estimate_scale, make_matching_plot,
-                          error_colormap, AverageTimer, pose_auc, plot_3d_vectors, read_image, read_rgb_image,
+                          error_colormap, AverageTimer, pose_auc, plot_3d_vectors, project_images_torch, read_image, read_rgb_image,
                           rotate_intrinsics, rotate_pose_inplane,
-                          scale_intrinsics, frame2tensor,project_images, compute_sem_match_stat)
+                          scale_intrinsics, frame2tensor,project_images, compute_sem_match_stat, project_images_fast)
 from models.LGutils import load_image_LG
+from models.loader import ImagePairDataset
+
+from multiprocessing import Process, Queue
 
 torch.set_grad_enabled(False)
 
@@ -195,7 +201,7 @@ if __name__ == '__main__':
             raise ValueError(
                 'All pairs should have ground truth info for evaluation.'
                 'File \"{}\" needs 38 valid entries per row'.format(opt.input_pairs))
-    
+
 
     # Load the SuperPoint and SuperGlue models.
     device = 'cuda' if torch.cuda.is_available() and not opt.force_cpu else 'cpu'
@@ -227,7 +233,35 @@ if __name__ == '__main__':
         print('Will write visualization images to',
               'directory \"{}\"'.format(output_dir))
 
-    yolo = YOLO("./models/weights/yolo.pt").to('cpu')
+    conf_mat_queue = Queue()
+
+    def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        plt.figure(figsize=(5, 4))
+        sns.heatmap(conf_matrix, annot=True, cmap=cmap, fmt='g')
+        plt.title(title)
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.tight_layout()
+        plt.savefig(image_path)
+        plt.close()
+
+    def confusion_matrix_writer(queue):
+        while True:
+            item = queue.get()
+            if item is None: break
+            conf_matrix, title, path, cmap = item
+            save_confusion_matrix(conf_matrix, title, path, cmap)
+
+    writer = Process(target=confusion_matrix_writer, args=(conf_mat_queue,))
+    writer.start()
+
+    # yolo = YOLO("./models/weights/yolo.pt").to('cpu')
+    yolo = YOLO("./models/weights/yolo.pt")
     timer = AverageTimer(newline=True)
     epis = []
 
@@ -238,39 +272,216 @@ if __name__ == '__main__':
     bg2bg = []
     ins2ins = []
 
-    for i, pair in enumerate(pairs):
-        name0, name1 = pair[:2]
-        stem0, stem1 = Path(name0).stem, Path(name1).stem
-        matches_path = output_dir / '{}_{}_matches.npz'.format(stem0, stem1)
-        eval_path = output_dir / '{}_{}_evaluation.npz'.format(stem0, stem1)
-        viz_path = output_dir / '{}_{}_matches.{}'.format(stem0, stem1, opt.viz_extension)
-        viz_eval_path = output_dir / \
-            '{}_{}_evaluation.{}'.format(stem0, stem1, opt.viz_extension)
+    batch_size = 16
+    dataset = ImagePairDataset(opt.input_dir, pairs)
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=4, shuffle=False)
 
-        # Handle --cache logic.
-        do_match = True
-        do_eval = opt.eval
-        do_viz = opt.viz
-        do_viz_eval = opt.eval and opt.viz
-        if opt.cache:
-            if matches_path.exists():
-                try:
-                    results = np.load(matches_path)
-                except:
-                    raise IOError('Cannot load matches .npz file: %s' %
-                                  matches_path)
+    # for i, pair in enumerate(pairs):
+    for batch_idx, batch in enumerate(dataloader):
+        pairs_batch, (image0_batch, image1_batch), (inp0_batch, inp1_batch), (scales0_batch, scales1_batch), (rgb0_batch, rgb1_batch), (yoloimg0_batch, yoloimg1_batch) = batch
+        inp0_batch = inp0_batch.to(device)
+        inp1_batch = inp1_batch.to(device)
+        rgb0_batch = rgb0_batch.to(device)
+        rgb1_batch = rgb1_batch.to(device)
+        yoloimg0_batch = yoloimg0_batch.numpy()
+        yoloimg1_batch = yoloimg1_batch.numpy()
+        for sample_idx in range(len(pairs_batch[0])):
+            i = (batch_idx * batch_size) + sample_idx
+            # pair = pairs_batch[sample_idx]
+            pair = [p[sample_idx] for p in pairs_batch]
 
-                kpts0, kpts1 = results['keypoints0'], results['keypoints1']
-                matches, conf = results['matches'], results['match_confidence']
-                do_match = False
+            image0 = image0_batch[sample_idx]
+            image1 = image1_batch[sample_idx]
+            inp0 = inp0_batch[sample_idx]
+            inp1 = inp1_batch[sample_idx]
+            scales0 = [float(s[sample_idx]) for s in scales0_batch]
+            scales1 = [float(s[sample_idx]) for s in scales1_batch]
+            rgb0 = rgb0_batch[sample_idx]
+            rgb1 = rgb1_batch[sample_idx]
 
+            name0, name1 = pair[:2]
+            stem0, stem1 = Path(name0).stem, Path(name1).stem
+            matches_path = output_dir / '{}_{}_matches.npz'.format(stem0, stem1)
+            eval_path = output_dir / '{}_{}_evaluation.npz'.format(stem0, stem1)
+            viz_path = output_dir / '{}_{}_matches.{}'.format(stem0, stem1, opt.viz_extension)
+            viz_eval_path = output_dir / \
+                '{}_{}_evaluation.{}'.format(stem0, stem1, opt.viz_extension)
+
+            # Handle --cache logic.
+            do_match = True
+            do_eval = opt.eval
+            do_viz = opt.viz
+            do_viz_eval = opt.eval and opt.viz
+            if opt.cache:
+                if matches_path.exists():
+                    try:
+                        results = np.load(matches_path)
+                    except:
+                        raise IOError('Cannot load matches .npz file: %s' %
+                                    matches_path)
+
+                    kpts0, kpts1 = results['keypoints0'], results['keypoints1']
+                    matches, conf = results['matches'], results['match_confidence']
+                    do_match = False
+
+                    #'''
+                    # New Code: Calculate and save confusion matrix
+                    # True labels: whether the keypoints in image0 and corresponding match in image1 are foreground or background
+                    indexes0 = results['indexes0']
+                    indexes1 = results['indexes1']
+                    valid_matches = matches != -1  # Matches that are valid (not -1)
+
+                    matched_indexes0 = indexes0[valid_matches]  # Keypoints in image0 that have valid matches
+                    matched_indexes1 = matches[valid_matches]   # Corresponding keypoint indices in image1 from the matches
+                    matched_indexes1_labels = indexes1[matched_indexes1]  # Get labels of the matched keypoints in image1
+
+                    # True if both matched keypoints in image0 and image1 are in semantic (foreground) regions
+                    true_labels0 = matched_indexes0 >= 0
+                    true_labels1 = matched_indexes1_labels >= 0
+
+                    # Predicted labels: Consider matched keypoints as valid if they are in the semantic regions in both images
+                    predicted_labels = true_labels0 & true_labels1
+
+                    # Calculate confusion matrix
+                    conf_matrix = confusion_matrix(true_labels0, predicted_labels, labels=[0, 1])
+
+                    # Accumulate confusion matrices
+                    if conf_matrix_sum is None:
+                        conf_matrix_sum = conf_matrix
+                    else:
+                        conf_matrix_sum += conf_matrix
+                    num_pairs += 1
+
+                    # Create the output directory for confusion matrices if it does not exist
+                    conf_output_dir = Path(output_dir) / "conf_matrices"
+                    conf_output_dir.mkdir(exist_ok=True, parents=True)
+
+                    # Function to save confusion matrix as an image
+                    # def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
+                    #     plt.figure(figsize=(5, 4))
+                    #     sns.heatmap(conf_matrix, annot=True, cmap=cmap, fmt='g')
+                    #     plt.title(title)
+                    #     plt.xlabel('Predicted Label')
+                    #     plt.ylabel('True Label')
+                    #     plt.tight_layout()
+                    #     plt.savefig(image_path)
+                    #     plt.close()
+
+                    # Save confusion matrices as images for each pair
+                    # save_confusion_matrix(conf_matrix, "Confusion Matrix for Matches in Image 0",
+                    #                     conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png")
+                    conf_mat_queue.put(
+                        (conf_matrix,
+                        "Confusion Matrix for Matches in Image 0",
+                        conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png",
+                        "Blues")
+                    )
+                    #'''
+
+                if opt.eval and eval_path.exists():
+                    try:
+                        results = np.load(eval_path)
+                    except:
+                        raise IOError('Cannot load eval .npz file: %s' % eval_path)
+                    err_R, err_t = results['error_R'], results['error_t']
+                    precision = results['precision']
+                    matching_score = results['matching_score']
+                    num_correct = results['num_correct']
+                    epi_errs = results['epipolar_errors']
+                    do_eval = False
+
+                if opt.viz and viz_path.exists():
+                    do_viz = False
+                if opt.viz and opt.eval and viz_eval_path.exists():
+                    do_viz_eval = False
+                timer.update('load_cache')
+
+            if not (do_match or do_eval or do_viz or do_viz_eval):
+                timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
+                continue
+
+            # If a rotation integer is provided (e.g. from EXIF data), use it:
+            if len(pair) >= 5:
+                rot0, rot1 = int(pair[2]), int(pair[3])
+            else:
+                rot0, rot1 = 0, 0
+
+            # TODO FIX IMAGE LOADING HERE
+
+            # Load the image pair.
+            # image0, inp0, scales0 = read_image(
+            #     input_dir / name0, device, opt.resize, rot0, opt.resize_float)
+            # image1, inp1, scales1 = read_image(
+            #     input_dir / name1, device, opt.resize, rot1, opt.resize_float)
+
+            # # Load image pair for lightglue SIFT
+            # rgb0 = load_image_LG(input_dir / name0, opt.resize).cuda()
+            # rgb1 = load_image_LG(input_dir / name1, opt.resize).cuda()
+
+            if image0 is None or image1 is None:
+                print('Problem reading image pair: {} {}'.format(
+                    input_dir/name0, input_dir/name1))
+                exit(1)
+            timer.update('load_image')
+
+            if do_match:
+                # Perform the matching.
+                #'''
+                # Added for YOLO START
+                resized_masks0 = None
+                resized_masks1 = None
+
+                # yoloimg = cv2.imread(str(input_dir / name0))
+                # yoloimg = cv2.resize(yoloimg, (640, 640))
+                yoloimg = yoloimg0_batch[sample_idx]
+                result0 = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False, device=0)
+                # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
+                if result0[0].masks is not None:
+                    masks = result0[0].masks.data.cpu().numpy()
+                    #combined_mask = np.any(masks, axis=0).astype(np.uint8)
+                    #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
+                    resized_masks0 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
+                    for j in range(masks.shape[0]):
+                        resized_masks0[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
+                        resized_masks0[j][resized_masks0[j] == 1] = 255
+                        resized_masks0[j][resized_masks0[j] != 255] = 0
+
+                # yoloimg = cv2.imread(str(input_dir / name1))
+                # yoloimg = cv2.resize(yoloimg, (640, 640))
+                yoloimg = yoloimg1_batch[sample_idx]
+                result1 = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False, device=0)
+                # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
+                if result1[0].masks is not None:
+                    masks = result1[0].masks.data.cpu().numpy()
+                    #combined_mask = np.any(masks, axis=0).astype(np.uint8)
+                    #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
+                    resized_masks1 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
+                    for j in range(masks.shape[0]):
+                        resized_masks1[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
+                        resized_masks1[j][resized_masks1[j] == 1] = 255
+                        resized_masks1[j][resized_masks1[j] != 255] = 0
+
+                timer.update('YOLO')
+                # Added for YOLO END
+                #Note: Utils line 428 was added to set z=0.0
+                #'''
+                pred = matching({'image0': inp0, 'image1': inp1, 'gs0': image0, 'gs1': image1, 'rgb0': rgb0, 'rgb1': rgb1}, resized_masks0, resized_masks1)
+                pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+                kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
+                matches, conf = pred['matches0'], pred['matching_scores0']
+                indexes0 = pred['indexes0']
+                indexes1 = pred['indexes1']
+                timer.update('matcher')
+
+                # Write the matches to disk.
+                out_matches = {'keypoints0': kpts0, 'keypoints1': kpts1,
+                            'matches': matches, 'match_confidence': conf,
+                                'indexes0':indexes0, 'indexes1':indexes1}
+                np.savez(str(matches_path), **out_matches)
                 #'''
                 # New Code: Calculate and save confusion matrix
                 # True labels: whether the keypoints in image0 and corresponding match in image1 are foreground or background
-                indexes0 = results['indexes0']
-                indexes1 = results['indexes1']
                 valid_matches = matches != -1  # Matches that are valid (not -1)
-                
                 matched_indexes0 = indexes0[valid_matches]  # Keypoints in image0 that have valid matches
                 matched_indexes1 = matches[valid_matches]   # Corresponding keypoint indices in image1 from the matches
                 matched_indexes1_labels = indexes1[matched_indexes1]  # Get labels of the matched keypoints in image1
@@ -297,326 +508,216 @@ if __name__ == '__main__':
                 conf_output_dir.mkdir(exist_ok=True, parents=True)
 
                 # Function to save confusion matrix as an image
-                def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
-                    plt.figure(figsize=(5, 4))
-                    sns.heatmap(conf_matrix, annot=True, cmap=cmap, fmt='g')
-                    plt.title(title)
-                    plt.xlabel('Predicted Label')
-                    plt.ylabel('True Label')
-                    plt.tight_layout()
-                    plt.savefig(image_path)
-                    plt.close()
+                # def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
+                #     plt.figure(figsize=(5, 4))
+                #     sns.heatmap(conf_matrix, annot=True, cmap=cmap, fmt='g')
+                #     plt.title(title)
+                #     plt.xlabel('Predicted Label')
+                #     plt.ylabel('True Label')
+                #     plt.tight_layout()
+                #     plt.savefig(image_path)
+                #     plt.close()
 
                 # Save confusion matrices as images for each pair
-                save_confusion_matrix(conf_matrix, "Confusion Matrix for Matches in Image 0",
-                                    conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png")
+                # save_confusion_matrix(conf_matrix, "Confusion Matrix for Matches in Image 0",
+                #                     conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png")
+                conf_mat_queue.put(
+                    (conf_matrix,
+                    "Confusion Matrix for Matches in Image 0",
+                    conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png",
+                    "Blues")
+                )
                 #'''
+            # Keep the matching keypoints.
+            valid = matches > -1
+            mkpts0 = kpts0[valid]
+            mkpts1 = kpts1[matches[valid]]
+            mconf = conf[valid]
 
-            if opt.eval and eval_path.exists():
-                try:
-                    results = np.load(eval_path)
-                except:
-                    raise IOError('Cannot load eval .npz file: %s' % eval_path)
-                err_R, err_t = results['error_R'], results['error_t']
-                precision = results['precision']
-                matching_score = results['matching_score']
-                num_correct = results['num_correct']
-                epi_errs = results['epipolar_errors']
-                do_eval = False
+            if do_eval:
+                # Estimate the pose and compute the pose error.
+                assert len(pair) == 38, 'Pair does not have ground truth info'
+                K0_original = np.array(pair[4:13]).astype(float).reshape(3, 3)
+                K1_original = np.array(pair[13:22]).astype(float).reshape(3, 3)
+                T_0to1 = np.array(pair[22:]).astype(float).reshape(4, 4)
 
-            if opt.viz and viz_path.exists():
-                do_viz = False
-            if opt.viz and opt.eval and viz_eval_path.exists():
-                do_viz_eval = False
-            timer.update('load_cache')
+                # Scale the intrinsics to resized image.
+                K0 = scale_intrinsics(K0_original, scales0)
+                K1 = scale_intrinsics(K1_original, scales1)
 
-        if not (do_match or do_eval or do_viz or do_viz_eval):
+                # Update the intrinsics + extrinsics if EXIF rotation was found.
+                if rot0 != 0 or rot1 != 0:
+                    cam0_T_w = np.eye(4)
+                    cam1_T_w = T_0to1
+                    if rot0 != 0:
+                        K0 = rotate_intrinsics(K0, image0.shape, rot0)
+                        cam0_T_w = rotate_pose_inplane(cam0_T_w, rot0)
+                    if rot1 != 0:
+                        K1 = rotate_intrinsics(K1, image1.shape, rot1)
+                        cam1_T_w = rotate_pose_inplane(cam1_T_w, rot1)
+                    cam1_T_cam0 = cam1_T_w @ np.linalg.inv(cam0_T_w)
+                    T_0to1 = cam1_T_cam0
+
+                epi_errs = compute_epipolar_error(mkpts0, mkpts1, T_0to1, K0, K1)
+                epis.append(np.mean(epi_errs))
+                correct = epi_errs < 5e-4 # 2e-3 5e-4
+                num_correct = np.sum(correct)
+                precision = np.mean(correct) if len(correct) > 0 else 0
+                matching_score = num_correct / len(kpts0) if len(kpts0) > 0 else 0
+
+                thresh = 1.  # In pixels relative to resized image size.
+
+                # Get depth based pose estimation
+                depth0 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name0.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
+                depth1 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name1.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
+                #ret = estimate_pose_3d(mkpts0, mkpts1, depth0, depth1, K0_original, K1_original, scales0, scales1)
+                #plot_pointcloud_with_rgb(image0,depth0,K0)
+
+                ret = estimate_pose(mkpts0, mkpts1, K0, K1, thresh)
+                if ret is None:
+                    err_t, err_R = np.inf, np.inf
+                    R = np.eye(3)
+                    t = np.zeros(3)
+                else:
+                    R, t, inliers = ret
+                    err_t, err_R = compute_pose_error(T_0to1, R, t)
+
+                # Write the evaluation results to disk.
+                out_eval = {'error_t': err_t,
+                            'error_R': err_R,
+                            'precision': precision,
+                            'matching_score': matching_score,
+                            'num_correct': num_correct,
+                            'epipolar_errors': epi_errs}
+                np.savez(str(eval_path), **out_eval)
+
+                resized_masks0_uint8 = resized_masks0.astype(np.uint8)
+                resized_masks1_uint8 = resized_masks1.astype(np.uint8)
+
+                # For a (3, 3) rotation matrix:
+                rotation_matrix = T_0to1[:3, :3]
+                if rotation_matrix.ndim == 2:
+                    rotation_matrix = rotation_matrix[None, :, :]  # shape becomes (1, 3, 3)
+
+                # For a (3,) translation vector:
+                translation_vec = T_0to1[:3, 3]
+                if translation_vec.ndim == 1:
+                    translation_vec = translation_vec.reshape(1, 3, 1)  # shape becomes (1, 3, 1)
+
+                # np.save('resized_masks0_uint8.npy', resized_masks0_uint8)
+                # np.save('rotation_matrix.npy', rotation_matrix)
+                # np.save('translation_vec.npy', translation_vec)
+                # np.save('K0.npy', K0)
+                # np.save('resized_masks1_uint8.npy', resized_masks1_uint8)
+
+                iou, iou_indexes = project_images_torch(resized_masks0_uint8, rotation_matrix[0], translation_vec[0], K0, resized_masks1_uint8)
+                stat = compute_sem_match_stat(kpts0, kpts1,indexes0, indexes1, iou_indexes, matches)
+                sem2sem.append(stat['semantics_to_semantics_pct'])
+                bg2bg.append(stat['background_to_background_pct'])
+                ins2ins.append(stat['correct_mask_pct'])
+
+                # Convert ground truth and recovered rotation/translation to transformation matrices
+                gt_pose = T_0to1
+                _, t_scaled = estimate_scale(mkpts0, mkpts1, depth0, depth1, scales0, scales1, K0_original, K1_original, R, t, abs(np.linalg.norm(gt_pose[:3,3])))
+
+                if t_scaled is None:
+                    ret = None
+                if ret is not None:
+                    recovered_pose = np.eye(4)
+                    recovered_pose[:3, :3] = R
+                    recovered_pose[:3, 3] = t_scaled
+                    rp += recovered_pose[:3, 3]
+                    #plot_3d_vectors(t_scaled, gt_pose[:3,3])
+                else:
+                    recovered_pose = None
+
+                # Save ground truth and recovered poses to an npz file
+                output_pose_data = {
+                    'ground_truth_pose': gt_pose
+                }
+                if recovered_pose is not None:
+                    output_pose_data['recovered_pose'] = recovered_pose
+
+                np.savez(str(output_dir / '{}_{}_poses.npz'.format(stem0, stem1)), **output_pose_data)
+
+                timer.update('eval')
+
+            if do_viz:
+                # Visualize the matches.
+                color = cm.jet(mconf)
+                text = [
+                    'SuperGlue',
+                    'Keypoints: {}:{}'.format(len(kpts0), len(kpts1)),
+                    'Matches: {}'.format(len(mkpts0)),
+                ]
+                if rot0 != 0 or rot1 != 0:
+                    text.append('Rotation: {}:{}'.format(rot0, rot1))
+
+                # Display extra parameter info.
+                k_thresh = matching.superpoint.config['keypoint_threshold']
+                m_thresh = matching.superglue.config['match_threshold']
+                small_text = [
+                    'Keypoint Threshold: {:.4f}'.format(k_thresh),
+                    'Match Threshold: {:.2f}'.format(m_thresh),
+                    'Image Pair: {}:{}'.format(stem0, stem1),
+                ]
+
+                make_matching_plot(
+                    image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
+                    text, viz_path, opt.show_keypoints,
+                    opt.fast_viz, opt.opencv_display, 'Matches', small_text)
+
+                timer.update('viz_match')
+
+            if do_viz_eval:
+                # Visualize the evaluation results for the image pair.
+                color = np.clip((epi_errs - 0) / (1e-3 - 0), 0, 1)
+                color = error_colormap(1 - color)
+                deg, delta = ' deg', 'Delta '
+                if not opt.fast_viz:
+                    deg, delta = '°', '$\\Delta$'
+                e_t = 'FAIL' if np.isinf(err_t) else '{:.1f}{}'.format(err_t, deg)
+                e_R = 'FAIL' if np.isinf(err_R) else '{:.1f}{}'.format(err_R, deg)
+                text = [
+                    'SuperGlue',
+                    '{}R: {}'.format(delta, e_R), '{}t: {}'.format(delta, e_t),
+                    'inliers: {}/{}'.format(num_correct, (matches > -1).sum()),
+                ]
+                if rot0 != 0 or rot1 != 0:
+                    text.append('Rotation: {}:{}'.format(rot0, rot1))
+
+                # Display extra parameter info (only works with --fast_viz).
+                k_thresh = matching.superpoint.config['keypoint_threshold']
+                m_thresh = matching.superglue.config['match_threshold']
+                small_text = [
+                    'Keypoint Threshold: {:.4f}'.format(k_thresh),
+                    'Match Threshold: {:.2f}'.format(m_thresh),
+                    'Image Pair: {}:{}'.format(stem0, stem1),
+                ]
+
+                make_matching_plot(
+                    image0, image1, kpts0, kpts1, mkpts0,
+                    mkpts1, color, text, viz_eval_path,
+                    opt.show_keypoints, opt.fast_viz,
+                    opt.opencv_display, 'Relative Pose', small_text)
+
+                timer.update('viz_eval')
+
             timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
-            continue
-
-        # If a rotation integer is provided (e.g. from EXIF data), use it:
-        if len(pair) >= 5:
-            rot0, rot1 = int(pair[2]), int(pair[3])
-        else:
-            rot0, rot1 = 0, 0
-
-        # Load the image pair.
-        image0, inp0, scales0 = read_image(
-            input_dir / name0, device, opt.resize, rot0, opt.resize_float)
-        image1, inp1, scales1 = read_image(
-            input_dir / name1, device, opt.resize, rot1, opt.resize_float)
-        
-        # Load image pair for lightglue SIFT
-        rgb0 = load_image_LG(input_dir / name0, opt.resize).cuda()
-        rgb1 = load_image_LG(input_dir / name1,opt.resize).cuda()
-        
-        if image0 is None or image1 is None:
-            print('Problem reading image pair: {} {}'.format(
-                input_dir/name0, input_dir/name1))
-            exit(1)
-        timer.update('load_image')
-
-        if do_match:
-            # Perform the matching.
-            #'''
-            # Added for YOLO START
-            resized_masks0 = None
-            resized_masks1 = None
-
-            yoloimg = cv2.imread(str(input_dir / name0))
-            yoloimg = cv2.resize(yoloimg, (640, 640))
-            result = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False)
-            # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
-            if result[0].masks is not None:
-                masks = result[0].masks.data.cpu().numpy()
-                #combined_mask = np.any(masks, axis=0).astype(np.uint8)
-                #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
-                resized_masks0 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
-                for j in range(masks.shape[0]):
-                    resized_masks0[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
-                    resized_masks0[j][resized_masks0[j] == 1] = 255
-                    resized_masks0[j][resized_masks0[j] != 255] = 0 
-
-            yoloimg = cv2.imread(str(input_dir / name1))
-            yoloimg = cv2.resize(yoloimg, (640, 640))
-            result = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False) 
-            # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
-            if result[0].masks is not None:
-                masks = result[0].masks.data.cpu().numpy()
-                #combined_mask = np.any(masks, axis=0).astype(np.uint8)
-                #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
-                resized_masks1 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
-                for j in range(masks.shape[0]):
-                    resized_masks1[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
-                    resized_masks1[j][resized_masks1[j] == 1] = 255
-                    resized_masks1[j][resized_masks1[j] != 255] = 0
-                    
-            timer.update('YOLO')
-            # Added for YOLO END
-            #Note: Utils line 428 was added to set z=0.0
-            #'''
-            pred = matching({'image0': inp0, 'image1': inp1, 'gs0': image0, 'gs1': image1, 'rgb0': rgb0, 'rgb1': rgb1}, resized_masks0, resized_masks1)
-            pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
-            kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
-            matches, conf = pred['matches0'], pred['matching_scores0']
-            indexes0 = pred['indexes0']
-            indexes1 = pred['indexes1']
-            timer.update('matcher')
-
-            # Write the matches to disk.
-            out_matches = {'keypoints0': kpts0, 'keypoints1': kpts1,
-                           'matches': matches, 'match_confidence': conf,
-                            'indexes0':indexes0, 'indexes1':indexes1}
-            np.savez(str(matches_path), **out_matches)
-            #'''
-            # New Code: Calculate and save confusion matrix
-            # True labels: whether the keypoints in image0 and corresponding match in image1 are foreground or background
-            valid_matches = matches != -1  # Matches that are valid (not -1)
-            matched_indexes0 = indexes0[valid_matches]  # Keypoints in image0 that have valid matches
-            matched_indexes1 = matches[valid_matches]   # Corresponding keypoint indices in image1 from the matches
-            matched_indexes1_labels = indexes1[matched_indexes1]  # Get labels of the matched keypoints in image1
-
-            # True if both matched keypoints in image0 and image1 are in semantic (foreground) regions
-            true_labels0 = matched_indexes0 >= 0
-            true_labels1 = matched_indexes1_labels >= 0
-
-            # Predicted labels: Consider matched keypoints as valid if they are in the semantic regions in both images
-            predicted_labels = true_labels0 & true_labels1
-
-            # Calculate confusion matrix
-            conf_matrix = confusion_matrix(true_labels0, predicted_labels, labels=[0, 1])
-
-            # Accumulate confusion matrices
-            if conf_matrix_sum is None:
-                conf_matrix_sum = conf_matrix
-            else:
-                conf_matrix_sum += conf_matrix
-            num_pairs += 1
-
-            # Create the output directory for confusion matrices if it does not exist
-            conf_output_dir = Path(output_dir) / "conf_matrices"
-            conf_output_dir.mkdir(exist_ok=True, parents=True)
-
-            # Function to save confusion matrix as an image
-            def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
-                plt.figure(figsize=(5, 4))
-                sns.heatmap(conf_matrix, annot=True, cmap=cmap, fmt='g')
-                plt.title(title)
-                plt.xlabel('Predicted Label')
-                plt.ylabel('True Label')
-                plt.tight_layout()
-                plt.savefig(image_path)
-                plt.close()
-
-            # Save confusion matrices as images for each pair
-            save_confusion_matrix(conf_matrix, "Confusion Matrix for Matches in Image 0",
-                                conf_output_dir / f"{stem0}_{stem1}_conf_matrix_image0.png")
-            #'''
-        # Keep the matching keypoints.
-        valid = matches > -1
-        mkpts0 = kpts0[valid]
-        mkpts1 = kpts1[matches[valid]]
-        mconf = conf[valid]
-
-        if do_eval:
-            # Estimate the pose and compute the pose error.
-            assert len(pair) == 38, 'Pair does not have ground truth info'
-            K0_original = np.array(pair[4:13]).astype(float).reshape(3, 3)
-            K1_original = np.array(pair[13:22]).astype(float).reshape(3, 3)
-            T_0to1 = np.array(pair[22:]).astype(float).reshape(4, 4)
-
-            # Scale the intrinsics to resized image.
-            K0 = scale_intrinsics(K0_original, scales0)
-            K1 = scale_intrinsics(K1_original, scales1)
-
-            # Update the intrinsics + extrinsics if EXIF rotation was found.
-            if rot0 != 0 or rot1 != 0:
-                cam0_T_w = np.eye(4)
-                cam1_T_w = T_0to1
-                if rot0 != 0:
-                    K0 = rotate_intrinsics(K0, image0.shape, rot0)
-                    cam0_T_w = rotate_pose_inplane(cam0_T_w, rot0)
-                if rot1 != 0:
-                    K1 = rotate_intrinsics(K1, image1.shape, rot1)
-                    cam1_T_w = rotate_pose_inplane(cam1_T_w, rot1)
-                cam1_T_cam0 = cam1_T_w @ np.linalg.inv(cam0_T_w)
-                T_0to1 = cam1_T_cam0
-
-            epi_errs = compute_epipolar_error(mkpts0, mkpts1, T_0to1, K0, K1)
-            epis.append(np.mean(epi_errs))
-            correct = epi_errs < 5e-4 # 2e-3 5e-4
-            num_correct = np.sum(correct)
-            precision = np.mean(correct) if len(correct) > 0 else 0
-            matching_score = num_correct / len(kpts0) if len(kpts0) > 0 else 0
-
-            thresh = 1.  # In pixels relative to resized image size.
-
-            # Get depth based pose estimation
-            depth0 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name0.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
-            depth1 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name1.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
-            #ret = estimate_pose_3d(mkpts0, mkpts1, depth0, depth1, K0_original, K1_original, scales0, scales1)
-            #plot_pointcloud_with_rgb(image0,depth0,K0)
-            
-            ret = estimate_pose(mkpts0, mkpts1, K0, K1, thresh)
-            if ret is None:
-                err_t, err_R = np.inf, np.inf
-                R = np.eye(3)
-                t = np.zeros(3)
-            else:
-                R, t, inliers = ret
-                err_t, err_R = compute_pose_error(T_0to1, R, t)
-
-            # Write the evaluation results to disk.
-            out_eval = {'error_t': err_t,
-                        'error_R': err_R,
-                        'precision': precision,    
-                        'matching_score': matching_score,
-                        'num_correct': num_correct,
-                        'epipolar_errors': epi_errs}
-            np.savez(str(eval_path), **out_eval)
-
-            _, iou, iou_indexes = project_images(resized_masks0, T_0to1[:3, :3], T_0to1[:3, 3], K0, resized_masks1, False)    
-            stat = compute_sem_match_stat(kpts0, kpts1,indexes0, indexes1, iou_indexes, matches)     
-            sem2sem.append(stat['semantics_to_semantics_pct'])
-            bg2bg.append(stat['background_to_background_pct'])
-            ins2ins.append(stat['correct_mask_pct'])          
-
-            # Convert ground truth and recovered rotation/translation to transformation matrices
-            gt_pose = T_0to1
-            _, t_scaled = estimate_scale(mkpts0, mkpts1, depth0, depth1, scales0, scales1, K0_original, K1_original, R, t, abs(np.linalg.norm(gt_pose[:3,3])))
-
-            if t_scaled is None:
-                ret = None
-            if ret is not None:
-                recovered_pose = np.eye(4)
-                recovered_pose[:3, :3] = R
-                recovered_pose[:3, 3] = t_scaled
-                rp += recovered_pose[:3, 3]
-                #plot_3d_vectors(t_scaled, gt_pose[:3,3])
-            else:
-                recovered_pose = None
-
-            # Save ground truth and recovered poses to an npz file
-            output_pose_data = {
-                'ground_truth_pose': gt_pose
-            }
-            if recovered_pose is not None:
-                output_pose_data['recovered_pose'] = recovered_pose
-
-            np.savez(str(output_dir / '{}_{}_poses.npz'.format(stem0, stem1)), **output_pose_data)
-
-            timer.update('eval')
-
-        if do_viz:
-            # Visualize the matches.
-            color = cm.jet(mconf)
-            text = [
-                'SuperGlue',
-                'Keypoints: {}:{}'.format(len(kpts0), len(kpts1)),
-                'Matches: {}'.format(len(mkpts0)),
-            ]
-            if rot0 != 0 or rot1 != 0:
-                text.append('Rotation: {}:{}'.format(rot0, rot1))
-
-            # Display extra parameter info.
-            k_thresh = matching.superpoint.config['keypoint_threshold']
-            m_thresh = matching.superglue.config['match_threshold']
-            small_text = [
-                'Keypoint Threshold: {:.4f}'.format(k_thresh),
-                'Match Threshold: {:.2f}'.format(m_thresh),
-                'Image Pair: {}:{}'.format(stem0, stem1),
-            ]
-
-            make_matching_plot(
-                image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
-                text, viz_path, opt.show_keypoints,
-                opt.fast_viz, opt.opencv_display, 'Matches', small_text)
-
-            timer.update('viz_match')
-
-        if do_viz_eval:
-            # Visualize the evaluation results for the image pair.
-            color = np.clip((epi_errs - 0) / (1e-3 - 0), 0, 1)
-            color = error_colormap(1 - color)
-            deg, delta = ' deg', 'Delta '
-            if not opt.fast_viz:
-                deg, delta = '°', '$\\Delta$'
-            e_t = 'FAIL' if np.isinf(err_t) else '{:.1f}{}'.format(err_t, deg)
-            e_R = 'FAIL' if np.isinf(err_R) else '{:.1f}{}'.format(err_R, deg)
-            text = [
-                'SuperGlue',
-                '{}R: {}'.format(delta, e_R), '{}t: {}'.format(delta, e_t),
-                'inliers: {}/{}'.format(num_correct, (matches > -1).sum()),
-            ]
-            if rot0 != 0 or rot1 != 0:
-                text.append('Rotation: {}:{}'.format(rot0, rot1))
-
-            # Display extra parameter info (only works with --fast_viz).
-            k_thresh = matching.superpoint.config['keypoint_threshold']
-            m_thresh = matching.superglue.config['match_threshold']
-            small_text = [
-                'Keypoint Threshold: {:.4f}'.format(k_thresh),
-                'Match Threshold: {:.2f}'.format(m_thresh),
-                'Image Pair: {}:{}'.format(stem0, stem1),
-            ]
-            
-            make_matching_plot(
-                image0, image1, kpts0, kpts1, mkpts0,
-                mkpts1, color, text, viz_eval_path,
-                opt.show_keypoints, opt.fast_viz,
-                opt.opencv_display, 'Relative Pose', small_text)
-
-            timer.update('viz_eval')
-
-        timer.print('Finished pair {:5} of {:5}'.format(i, len(pairs)))
     #'''
     # After processing all pairs, compute and save the average confusion matrix
     if num_pairs > 0:
         avg_conf_matrix = conf_matrix_sum / num_pairs
 
         # Save the average confusion matrices with a different colormap ('viridis')
-        save_confusion_matrix(avg_conf_matrix, "Average Confusion Matrix for Matches in Image 0",
-                            conf_output_dir / "average_conf_matrix_image0.png", cmap='viridis')
+        # save_confusion_matrix(avg_conf_matrix, "Average Confusion Matrix for Matches in Image 0",
+        #                     conf_output_dir / "average_conf_matrix_image0.png", cmap='viridis')
+        conf_mat_queue.put(
+            (avg_conf_matrix,
+            "Average Confusion Matrix for Matches in Image 0",
+            conf_output_dir / "average_conf_matrix_image0.png",
+            "viridis")
+        )
     # Create a DataFrame from the lists
     data = {
         'Semantics_to_Semantics_Percentage': sem2sem,

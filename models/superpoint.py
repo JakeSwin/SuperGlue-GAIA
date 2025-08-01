@@ -44,6 +44,7 @@ from pathlib import Path
 import torch
 from torch import nn
 import numpy as np
+from scipy.spatial import KDTree
 
 ENCDIM = 256
 
@@ -104,7 +105,7 @@ class LinearAutoencoder(nn.Module):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
-    
+
 class LinearEncoder(nn.Module):
     def __init__(self, input_dim=256, bottleneck_dim=256-ENCDIM):
         super(LinearEncoder, self).__init__()
@@ -113,7 +114,7 @@ class LinearEncoder(nn.Module):
     def forward(self, x):
         encoded = self.encoder(x)
         return encoded
-    
+
 class EncoderDecoder(nn.Module):
     def __init__(self, encoded_dim=ENCDIM):
         super(EncoderDecoder, self).__init__()
@@ -176,30 +177,64 @@ def find_nearest_masks_for_keypoints(masks, keypoints):
         x, y = keypoint
         min_distance = float('inf')
         nearest_mask_index = -1
-        
-        for i in range(N):            
+
+        for i in range(N):
             if points_with_255[i].size == 0:
                 # If there are no points with 255 in this mask, skip it
                 continue
-            
+
             # Calculate the squared Euclidean distance to the keypoint for each point with value 255
             distances = np.sqrt((points_with_255[i][:, 0] - y) ** 2 + (points_with_255[i][:, 1] - x) ** 2)
-            
+
             # Find the minimum distance in this mask
             min_dist_in_mask = np.min(distances)
-            
+
             # Update the nearest mask and distance if the current one is closer
             if min_dist_in_mask < min_distance:
                 min_distance = min_dist_in_mask
                 nearest_mask_index = i
-        
+
         # Store the nearest mask index for the current keypoint
         if min_distance < 2.0:
             result_indices.append(nearest_mask_index)
         else:
             result_indices.append(-1)
-    
+
     return np.array(result_indices)
+
+# def find_nearest_masks_for_keypoints(masks, keypoints):
+#     N = masks.shape[0]
+#     result_indices = []
+
+#     kpts = np.array(keypoints)
+#     yx = kpts[:, [1, 0]]  # (y, x) points
+
+#     # Build a KDTree for the 255 points in each mask
+#     trees = []
+#     for i in range(N):
+#         pts_255 = np.argwhere(masks[i] == 255)
+#         if pts_255.shape[0] > 0:
+#             trees.append(KDTree(pts_255))
+#         else:
+#             trees.append(None)
+
+#     # For each keypoint, query all KD trees to find the nearest mask
+#     for pt in yx:
+#         min_distance = float('inf')
+#         nearest_mask_index = -1
+#         for i, tree in enumerate(trees):
+#             if tree is None:
+#                 continue
+#             dist, _ = tree.query(pt, k=1, distance_upper_bound=2.0)
+#             if dist < min_distance:
+#                 min_distance = dist
+#                 nearest_mask_index = i
+#         if min_distance < 2.0:
+#             result_indices.append(nearest_mask_index)
+#         else:
+#             result_indices.append(-1)
+
+#     return np.array(result_indices)
 
 class SuperPoint(nn.Module):
     """SuperPoint Convolutional Detector and Descriptor
@@ -328,11 +363,11 @@ class SuperPoint(nn.Module):
         descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                for k, d in zip(keypoints, descriptors)]
-        
+
         #Modified to fit semantics from here
         if masks is not None:
             mask_indexes = find_nearest_masks_for_keypoints(masks, keypoints[0].cpu().numpy())
-           
+
             semantic_descriptors = []
             for idx, desc in enumerate(descriptors[0].T):
                 #'''
@@ -355,8 +390,8 @@ class SuperPoint(nn.Module):
                     bottleneck_vector = (encoded.cpu().numpy())
                     #semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
                     semantic_descriptors.append(desc.cpu().numpy()+bottleneck_vector[0])
-                    
-                    
+
+
                 else:
                 #'''
                     semantic_descriptors.append(desc.cpu().numpy())
@@ -379,11 +414,11 @@ class SuperPoint(nn.Module):
                     bottleneck_vector = (encoded.cpu().numpy())
                     semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
                     '''
-                
+
         else:
             mask_indexes = np.full((len(keypoints[0])), -1, dtype=np.int64)
             semantic_descriptors = descriptors[0].T.cpu()
-        
+
         descriptors = np.array(semantic_descriptors,np.float32)
         descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
         #descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).unsqueeze(0) #for branched

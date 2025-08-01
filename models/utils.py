@@ -52,7 +52,10 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib
 from sklearn.metrics import confusion_matrix
+from scipy.optimize import linear_sum_assignment
 import re
+import fast_util
+import torch.nn.functional as F
 matplotlib.use('TkAgg')
 
 
@@ -177,7 +180,7 @@ class VideoStreamer:
         grayim = cv2.resize(
             grayim, (w_new, h_new), interpolation=self.interp)
         return grayim
-    
+
     def load_rgb_image(self, impath):
         """ Read image as RGB and resize to img_size.
         Inputs
@@ -281,9 +284,17 @@ def process_resize(w, h, resize):
 def frame2tensor(frame, device):
     return torch.from_numpy(frame/255.).float()[None, None].to(device)
 
+# def frame2tensor(frame, device):
+#     # Convert BGR to grayscale if needed
+#     if frame.ndim == 3 and frame.shape[2] == 3:
+#         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#     frame = frame.astype('float32') / 255.0
+#     tensor = torch.from_numpy(frame)[None, None, :, :]  # [1, 1, H, W]
+#     return tensor.to(device)
+
 def read_rgb_image(path, device, resize, rotation, resize_float):
     image = cv2.imread(str(path))
-    
+
     if image is None:
         return None, None, None
     w, h = image.shape[1], image.shape[0]
@@ -299,7 +310,7 @@ def read_rgb_image(path, device, resize, rotation, resize_float):
         image = np.rot90(image, k=rotation)
         if rotation % 2:
             scales = scales[::-1]
-    
+
     inp = frame2tensor(image, device)
     return image, inp, scales
 
@@ -327,6 +338,121 @@ def read_image(path, device, resize, rotation, resize_float):
 
 # --- GEOMETRY ---
 
+# def iou_numpy(projected_image, exp_img):
+#     # Convert to boolean (assuming masks are 0/255)
+#     # proj_bool = projected_image.astype(bool)
+#     # exp_bool = exp_img.astype(bool)
+#     # Vectorized calculation
+#     intersection = np.logical_and(projected_image, exp_img)
+#     union = np.logical_or(projected_image, exp_img)
+#     intersection_count = np.sum(intersection)
+#     union_count = np.sum(union)
+#     if union_count == 0:
+#         if not np.any(projected_image) and not np.any(exp_img):
+#             return 1.0
+#         else:
+#             return 0.0
+#     return intersection_count / union_count
+
+def iou_numpy(projected_image, exp_img):
+    # Convert to boolean (assuming masks are 0/255)
+    # proj_bool = projected_image.astype(bool)
+    # exp_bool = exp_img.astype(bool)
+    # Vectorized calculation
+    intersection = np.logical_and(projected_image, exp_img)
+    union = np.logical_or(projected_image, exp_img)
+    intersection_count = np.count_nonzero(intersection)
+    union_count = np.count_nonzero(union)
+    if union_count == 0:
+        if not np.any(projected_image) and not np.any(exp_img):
+            return 1.0
+        else:
+            return 0.0
+    return intersection_count / union_count
+
+def project_images_fast(resized_masks0_uint8, rotation_matrix, translation_vec, K0, resized_masks1_uint8):
+    return fast_util.project_images(resized_masks0_uint8, rotation_matrix, translation_vec, K0, resized_masks1_uint8)
+
+def project_images_torch(result0, rotation_matrix, translation_vec, camera_matrix, result1):
+    IOU_THRESHOLD = 0.1
+    # m0_exp = result0[0].masks.data.unsqueeze(1)
+    # m1_exp = result1[0].masks.data.unsqueeze(0)
+    m0_exp = torch.from_numpy(result0).float().unsqueeze(1).to("cuda") # torch.Size([27, 1, 480, 640])
+    m1_exp = torch.from_numpy(result1).float().unsqueeze(0).to("cuda") # torch.Size([1, 31, 480, 640])
+    # May need to check the batch size of these matrixs and copy them only if there is one
+    # then again it could just be that only 1 is sent each time and that is not needed
+    rotation_matrix = torch.from_numpy(rotation_matrix).to("cuda") # torch.Size([3, 3])
+    translation_vec = torch.from_numpy(translation_vec).to("cuda") # torch.Size([3, 1])
+    camera_matrix = torch.from_numpy(camera_matrix).to("cuda") # torch.Size([3, 3])
+
+    H = 480
+    W = 640
+    N = m0_exp.shape[0]
+
+    m0 = F.interpolate(m0_exp, size=(H, W), mode="nearest")
+    m1 = F.interpolate(m1_exp, size=(H, W), mode="nearest")
+
+    # Project images here
+    device = m0.device
+    y_coords = torch.arange(H, device=device)
+    x_coords = torch.arange(W, device=device)
+    y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    ones = torch.ones_like(x_grid)
+    pixel_grid = torch.stack((x_grid, y_grid, ones), dim=0).reshape(3, -1)  # (3, H*W)
+
+    inv_K = torch.linalg.inv(camera_matrix)  # (3, 3)
+    norm_coords = inv_K @ pixel_grid.to(dtype=torch.float64)  # (3, H*W)
+
+    R_2x2 = rotation_matrix[:2, :2].unsqueeze(0).expand(N, 2, 2)   # (N, 2, 2)
+    t_2x1 = translation_vec[:2].unsqueeze(0).expand(N, 2, 1)  # (N, 2, 1)
+    norm_xy = norm_coords[:2, :].unsqueeze(0).expand(N, -1, -1)  # (N, 2, H*W)
+    transformed = torch.bmm(R_2x2, norm_xy) + t_2x1  # (N, 2, H*W)
+
+    K_2x2 = camera_matrix[:2, :2]
+    K_2x1 = camera_matrix[:2, 2:3]
+    K_2x2 = K_2x2.unsqueeze(0).expand(N, -1, -1)
+    K_2x1 = K_2x1.unsqueeze(0).expand(N, -1, -1)
+    proj_xy = torch.bmm(K_2x2, transformed) + K_2x1  # (N, 2, H*W)
+
+    proj_xy = proj_xy.view(N, 2, H, W)
+    grid_x = 2.0 * proj_xy[:, 0] / (W - 1) - 1.0  # Normalize to [-1, 1]
+    grid_y = 2.0 * proj_xy[:, 1] / (H - 1) - 1.0
+    grid = torch.stack((grid_x, grid_y), dim=-1).float()  # (N, H, W, 2)
+
+    projected_m0 = torch.nn.functional.grid_sample(
+        m0, grid, mode='nearest', padding_mode='zeros', align_corners=True
+    )
+
+    projected_m0 = projected_m0.bool()
+    m1 = m1.bool()
+
+    intersection = ((projected_m0 & m1).sum(dim=(2,3))).float()
+    union = ((projected_m0 | m1).sum(dim=(2,3))).float()
+
+    eps = 1e-7
+    iou_torch = intersection / (union + eps)
+    best_ious, _ = iou_torch.max(dim=1)
+
+    sorted_vals, sorted_indices = torch.sort(iou_torch, dim=1, descending=True)
+    # sorted_vals = sorted_vals.cpu().numpy()
+    # sorted_indices = sorted_indices.cpu().numpy()
+
+    best_ious = best_ious.cpu().numpy()
+
+    used_indexs = []
+    best_idxs = [-1] * len(m0_exp)
+
+    for x in range(m0.shape[0]):
+        for y in range(m1.shape[1]):
+            current_iou = sorted_vals[x][y].item()
+            current_idx = sorted_indices[x][y].item()
+            if current_idx not in used_indexs and current_iou > IOU_THRESHOLD:
+                best_idxs[x] = current_idx
+                used_indexs.append(current_idx)
+                break
+
+    return best_ious, best_idxs
+
 def project_images(input_images, rotation_matrices, translation_vectors, camera_matrix, expected_images=None, viz=False):
     """
     Projects a set of input binarized grayscale images based on given rotation, translation matrices, and camera intrinsic matrix.
@@ -352,7 +478,9 @@ def project_images(input_images, rotation_matrices, translation_vectors, camera_
     if input_images is None:
         print("Warning: input_images is None, skipping processing.")
         return [], [], []  # Or some other default value indicating no operation was performed
-    
+
+    input_images = input_images.astype(np.uint8)
+
     # IoU threshold
     IOU_THRESHOLD = 0.1
 
@@ -384,6 +512,7 @@ def project_images(input_images, rotation_matrices, translation_vectors, camera_
 
     # Keep track of the original indices of expected images
     if expected_images is not None:
+        expected_images = expected_images.astype(np.uint8)
         expected_indices = list(range(expected_images.shape[0]))
         # Convert expected_images to a list for internal management
         expected_images_list = [expected_images[i] for i in range(expected_images.shape[0])]
@@ -400,9 +529,9 @@ def project_images(input_images, rotation_matrices, translation_vectors, camera_
         if len(input_image.shape) != 2:
             raise ValueError(f"Input image at index {i} must be a grayscale image.")
 
-        unique_vals = np.unique(input_image)
-        if not (np.array_equal(unique_vals, [0]) or np.array_equal(unique_vals, [255]) or np.array_equal(unique_vals, [0, 255])):
-            raise ValueError(f"Input image at index {i} must be binarized with values 0 and 255.")
+        # unique_vals = np.unique(input_image)
+        # if not (np.array_equal(unique_vals, [0]) or np.array_equal(unique_vals, [255]) or np.array_equal(unique_vals, [0, 255])):
+        #     raise ValueError(f"Input image at index {i} must be binarized with values 0 and 255.")
 
         # Generate a grid of (x, y, 1) homogeneous coordinates
         y_coords, x_coords = np.indices((height, width))
@@ -447,26 +576,41 @@ def project_images(input_images, rotation_matrices, translation_vectors, camera_
                     raise ValueError(f"Expected image at index {expected_indices[idx]} must have the same size as the input image.")
 
                 # Validate that exp_img is binarized
-                unique_vals = np.unique(exp_img)
-                if not (np.array_equal(unique_vals, [0]) or np.array_equal(unique_vals, [255]) or np.array_equal(unique_vals, [0, 255])):
-                    raise ValueError(f"Expected image at index {expected_indices[idx]} must be binarized with values 0 and 255.")
+                # unique_vals = np.unique(exp_img)
+                # if not (np.array_equal(unique_vals, [0]) or np.array_equal(unique_vals, [255]) or np.array_equal(unique_vals, [0, 255])):
+                #     raise ValueError(f"Expected image at index {expected_indices[idx]} must be binarized with values 0 and 255.")
 
                 # Compute Intersection and Union
-                intersection = cv2.bitwise_and(projected_image, exp_img)
-                union = cv2.bitwise_or(projected_image, exp_img)
+                # intersection = cv2.bitwise_and(projected_image, exp_img)
+                # union = cv2.bitwise_or(projected_image, exp_img)
 
-                # Calculate IoU
-                intersection_count = np.count_nonzero(intersection)
-                union_count = np.count_nonzero(union)
+                # # Calculate IoU
+                # intersection_count = cv2.countNonZero(intersection)
+                # union_count = cv2.countNonZero(union)
 
-                # Handle the case where both masks are empty (union_count == 0)
+                # # Handle the case where both masks are empty (union_count == 0)
+                # if union_count == 0:
+                #     if cv2.countNonZero(projected_image) == 0 and cv2.countNonZero(exp_img) == 0:
+                #         iou = 1.0  # Both masks are empty; define IoU as 1
+                #     else:
+                #         iou = 0.0  # One mask is empty; define IoU as 0
+                # else:
+                #     iou = intersection_count / union_count
+                # print(projected_image.shape)
+                # print(exp_img.shape)
+                # cv2.imwrite('projected_image.jpg', projected_image)
+                # cv2.imwrite('exp_img.jpg', exp_img)
+                # projected_image_safe = np.ascontiguousarray(projected_image).astype("bool")
+                # exp_img_safe = np.ascontiguousarray(exp_img).astype("bool")
+                intersection_count = cv2.countNonZero(projected_image & exp_img)
+                union_count = cv2.countNonZero(projected_image | exp_img)
                 if union_count == 0:
-                    if np.count_nonzero(projected_image) == 0 and np.count_nonzero(exp_img) == 0:
-                        iou = 1.0  # Both masks are empty; define IoU as 1
+                    if cv2.countNonZero(projected_image) == 0 and cv2.countNonZero(exp_img) == 0:
+                        return 1.0
                     else:
-                        iou = 0.0  # One mask is empty; define IoU as 0
-                else:
-                    iou = intersection_count / union_count
+                        return 0.0
+                iou = intersection_count / union_count
+                # iou = iou_numpy(projected_image, exp_img)
 
                 # Update best IoU and expected image
                 if iou > best_iou:
@@ -682,7 +826,7 @@ def estimate_scale(keypoints0, keypoints1, depths0, depths1, scales0, scales1, K
 
     # Compute the scaled translation vector
     t_scaled = (s) * t  # t_scaled is now a 1D array of shape (3,)
-    #t_scaled = np.array([[0,0,1],[-1,0,0],[0,0,0]]) @ t_scaled 
+    #t_scaled = np.array([[0,0,1],[-1,0,0],[0,0,0]]) @ t_scaled
     #print(np.linalg.norm(t))
     #print(np.linalg.norm(t_scaled))
 
@@ -890,35 +1034,35 @@ def pose_auc(errors, thresholds):
 def plot_3d_vectors(t1, t2):
     """
     Plots two 3D vectors as arrows starting from the origin.
-    
+
     Parameters:
     t1, t2: Lists or arrays with 3 elements each representing the vectors in 3D space.
     """
     # Create a 3D plot
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    
+
     # Define origin
     origin = [0, 0, 0]
-    
+
     # Plot vector t1
     ax.quiver(*origin, t1[0], t1[1], t1[2], color='blue', label='t1', linewidth=2, arrow_length_ratio=0.1)
-    
+
     # Plot vector t2
     ax.quiver(*origin, t2[0], t2[1], t2[2], color='red', label='t2', linewidth=2, arrow_length_ratio=0.1)
-    
+
     # Set plot limits for better visualization
     max_range = max(np.linalg.norm(t1), np.linalg.norm(t2))
     ax.set_xlim([-max_range, max_range])
     ax.set_ylim([-max_range, max_range])
     ax.set_zlim([-max_range, max_range])
-    
+
     # Set labels and legend
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     ax.legend()
-    
+
     # Show the plot
     plt.show()
 
@@ -934,10 +1078,10 @@ def plot_pointcloud_with_rgb(image, depth_map, K):
     # Prepare lists for storing point cloud data
     points_3d = []
     colors = []
-    
+
     # Get image dimensions
     h, w = depth_map.shape
-    
+
     # Intrinsic parameters
     fx, fy = K[0, 0], K[1, 1]  # focal lengths
     cx, cy = K[0, 2], K[1, 2]  # principal point
@@ -946,7 +1090,7 @@ def plot_pointcloud_with_rgb(image, depth_map, K):
     for v in range(h):
         for u in range(w):
             z = depth_map[v, u]  # Depth value at pixel (u, v)
-            
+
             if z > 0:  # Only consider points with valid depth
                 # Calculate 3D coordinates
                 x = (u - cx) * z / fx
@@ -958,12 +1102,12 @@ def plot_pointcloud_with_rgb(image, depth_map, K):
     # Convert to numpy arrays
     points_3d = np.array(points_3d)
     colors = np.array(colors)
-    
+
     # Plot the 3D point cloud
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
     ax.scatter(points_3d[:, 0], points_3d[:, 1], points_3d[:, 2], c=colors, marker='o', s=1)
-    
+
     # Labeling and viewing settings
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
@@ -974,19 +1118,19 @@ def plot_pointcloud_with_rgb(image, depth_map, K):
 def visualize_3d_points(points_3d_0, points_3d_1=None, points_3d_0_transformed=None, mask=None):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    
+
     # Plot the initial set of points
     ax.scatter(points_3d_0[:, 0], points_3d_0[:, 1], points_3d_0[:, 2], c='b', marker='o', label='Points 3D 0')
-    
+
     # Plot the second set of points
     if points_3d_1 is not None:
         ax.scatter(points_3d_1[:, 0], points_3d_1[:, 1], points_3d_1[:, 2], c='r', marker='^', label='Points 3D 1')
-    
+
     # Plot the transformed points if provided
     if points_3d_0_transformed is not None:
-        ax.scatter(points_3d_0_transformed[:, 0], points_3d_0_transformed[:, 1], points_3d_0_transformed[:, 2], 
+        ax.scatter(points_3d_0_transformed[:, 0], points_3d_0_transformed[:, 1], points_3d_0_transformed[:, 2],
                    c='g', marker='x', label='Transformed Points 3D 0')
-    
+
     # Optional: Highlight inliers
     if mask is not None:
         inliers_0 = points_3d_0[mask == 1]
@@ -1096,7 +1240,7 @@ def make_matching_plot_fast(image0, image1, kpts0, kpts1, mkpts0,
     out[:H0, :W0] = image0  # Place image0 at the top
     out[H0+margin:H0+margin+H1, :W1] = image1  # Place image1 at the bottom
     out = np.stack([out]*3, -1)
-    
+
     if show_keypoints:
         kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
         white = (255, 255, 255)
@@ -1165,7 +1309,7 @@ def apply_mask(image, mask, alpha):
 
     return masked_image
 
-    
+
 def make_matching_plot_fast_rgb(image0, image1, mask0, mask1, kpts0, kpts1, mkpts0,
                             mkpts1, color, text, path=None,
                             show_keypoints=False, margin=10,
@@ -1184,7 +1328,7 @@ def make_matching_plot_fast_rgb(image0, image1, mask0, mask1, kpts0, kpts1, mkpt
     out = 255*np.ones((H, W, 3), np.uint8)
     out[:H0, :W0, :] = image0  # Place image0 at the top
     out[H0+margin:H0+margin+H1, :W1, :] = image1  # Place image1 at the bottom
-    
+
     if show_keypoints:
         kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
         white = (255, 255, 255)
@@ -1312,7 +1456,7 @@ def DimSqueeze(arr):
         return arr.shape[0]
     else:
         return arr.shape[1]
-    
+
 def concatenate_dictionaries(dict1, dict2):
     """
     Concatenates values from two dictionaries. If a key is present in both, it concatenates the values.
@@ -1348,7 +1492,7 @@ def concatenate_dictionaries(dict1, dict2):
             result[key] = dict2[key]
 
     return result
-    
+
 def reconstruct_predictions(pred, indexes0, indexes1, pred_background=None, pred_semantic=None):
     """
     Reconstruct the original prediction dictionary to have all the matches
@@ -1358,27 +1502,27 @@ def reconstruct_predictions(pred, indexes0, indexes1, pred_background=None, pred
     # Initialize placeholders with the same size as the original data
     num_keypoints0 = indexes0.shape[0]
     num_keypoints1 = indexes1.shape[0]
-    
+
     matches0 = -torch.ones(num_keypoints0, dtype=torch.long, device=pred['descriptors0'].device)
     matches1 = -torch.ones(num_keypoints1, dtype=torch.long, device=pred['descriptors1'].device)
     matching_scores0 = torch.zeros(num_keypoints0, device=pred['descriptors0'].device)
     matching_scores1 = torch.zeros(num_keypoints1, device=pred['descriptors1'].device)
-    
+
     # Separate indexes for background and semantic components
     bg_indexes0 = torch.where(indexes0 == -1)[0]
     bg_indexes1 = torch.where(indexes1 == -1)[0]
     sem_indexes0 = torch.where(indexes0 != -1)[0]
     sem_indexes1 = torch.where(indexes1 != -1)[0]
-    
+
     # If pred_background is provided, update matches and scores for background
     if pred_background is not None:
-        if 'matches0' in pred_background: 
+        if 'matches0' in pred_background:
             matches0[bg_indexes0] = pred_background['matches0'].squeeze(0)
             matching_scores0[bg_indexes0] = pred_background['matching_scores0'].squeeze(0)
         if 'matches1' in pred_background:
             matches1[bg_indexes1] = pred_background['matches1'].squeeze(0)
             matching_scores1[bg_indexes1] = pred_background['matching_scores1'].squeeze(0)
-    
+
     # If pred_semantic is provided, update matches and scores for semantic
     if pred_semantic is not None:
         if 'matches0' in pred_semantic:
@@ -1387,13 +1531,13 @@ def reconstruct_predictions(pred, indexes0, indexes1, pred_background=None, pred
         if 'matches1' in pred_semantic:
             matches1[sem_indexes1] = pred_semantic['matches1'].squeeze(0)
             matching_scores1[sem_indexes1] = pred_semantic['matching_scores1'].squeeze(0)
-    
+
     # Add the reconstructed matches and matching scores back to the pred dictionary
     pred['matches0'] = matches0.unsqueeze(0)
     pred['matches1'] = matches1.unsqueeze(0)
     pred['matching_scores0'] = matching_scores0.unsqueeze(0)
     pred['matching_scores1'] = matching_scores1.unsqueeze(0)
-    
+
     return pred
 
 def error_colormap(x):
@@ -1470,7 +1614,7 @@ def compute_sem_match_stat(
 
     semantics_to_semantics_pct = (TP / total) * 100
     background_to_background_pct = (TN / total) * 100
-    
+
     # Calculate correct mask percentage considering only valid IoU mappings
     if total_iou_considered > 0:
         correct_mask_pct = (correct_mask / total_iou_considered) * 100
