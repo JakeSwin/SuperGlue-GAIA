@@ -56,6 +56,7 @@ class Matching(torch.nn.Module):
     def __init__(self, config={}):
         super().__init__()
         self.superpoint = SuperPoint(config.get('superpoint', {}))
+        self.compiled_superpoint = torch.compile(self.superpoint)
         #self.orb = ORB()
         #self.sift = SIFT().eval().cuda() # LG SIFT
         self.sift = SIFT()
@@ -69,25 +70,29 @@ class Matching(torch.nn.Module):
           data: dictionary with minimal keys: ['image0', 'image1']
         """
         pred = {}
-        
+
         # Extract SuperPoint (keypoints, scores, descriptors) if not provided
         if 'keypoints0' not in data:
-            pred0 = self.superpoint({'image': data['image0']}, sem_background0)
+            with torch.inference_mode():
+                pred0 = self.compiled_superpoint({'image': data['image0']})
+            pred0 = self.superpoint.compute_semantic_descriptors(pred0, sem_background0)
             #pred0 = self.orb({'image': data['gs0']}, sem_background0)
             #pred0 = self.sift({'image': data['gs0']}, sem_background0)
             #pred0 = self.sift.extract(data['rgb0'], sem_background0)
             pred = {**pred, **{k+'0': v for k, v in pred0.items()}}
-            
+
         if 'keypoints1' not in data:
-            pred1 = self.superpoint({'image': data['image1']}, sem_background1)
+            with torch.inference_mode():
+                pred1 = self.compiled_superpoint({'image': data['image1']})
+            pred1 = self.superpoint.compute_semantic_descriptors(pred1, sem_background1)
             #pred1 = self.orb({'image': data['gs1']}, sem_background1)
             #pred1 = self.sift({'image': data['gs1']}, sem_background1)
             #pred1 = self.sift.extract(data['rgb1'], sem_background1)
             pred = {**pred, **{k+'1': v for k, v in pred1.items()}}
-        
+
         # Batch all features
         data = {**data, **pred}
-        
+
         for k in data:
             if isinstance(data[k], (list, tuple)):
                 data[k] = torch.stack(data[k])
@@ -98,7 +103,7 @@ class Matching(torch.nn.Module):
         #data['scores1'] = data.pop('keypoint_scores1') # For siftn LG
         #data['descriptors0'] = pred0['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)  # For sift
         #data['descriptors1'] = pred1['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)  # For sift
-        pred = {**pred, **self.superglue(data)} 
+        pred = {**pred, **self.superglue(data)}
 
         # LightGlue with SuperPoint
         #pred0['descriptors'] = pred0['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)
@@ -140,7 +145,7 @@ class Matching(torch.nn.Module):
                 else:
                     data_background1[k] = v
                     data_semantic1[k] = v
-        
+
         # Prepare data for background matches (indexes0 or indexes1 == -1)
         data_background = concatenate_dictionaries(data_background0, data_background1)
         if 'descriptors0' in data_background and 'descriptors1' in data_background:
@@ -152,12 +157,12 @@ class Matching(torch.nn.Module):
         if 'descriptors0' in data_semantic and 'descriptors1' in data_semantic:
             data_semantic['descriptors0'] = data_semantic['descriptors0'].squeeze(0).transpose(0, 1)[mask_semantic0].transpose(0, 1).unsqueeze(0)
             data_semantic['descriptors1'] = data_semantic['descriptors1'].squeeze(0).transpose(0, 1)[mask_semantic1].transpose(0, 1).unsqueeze(0)
-        
+
         # Perform the matching for background data
         pred_background = self.superglue(data_background) if len(data_background) > 0 else {}
         # Perform the matching for semantic data
         pred_semantic = self.superglue(data_semantic) if len(data_semantic) > 0 else {}
-        
+
         # Reconstruct the original prediction dictionary with matches
         pred = {**pred, ** reconstruct_predictions(pred, indexes0, indexes1, pred_background, pred_semantic)}
         #'''

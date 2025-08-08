@@ -44,7 +44,8 @@ from pathlib import Path
 import torch
 from torch import nn
 import numpy as np
-from scipy.spatial import KDTree
+
+# from fast_util import find_nearest_masks_for_keypoints
 
 ENCDIM = 256
 
@@ -164,77 +165,79 @@ class Encoder(nn.Module):
         encoded = self.encoder(x)
         return encoded
 
-def find_nearest_masks_for_keypoints(masks, keypoints):
-    N = masks.shape[0]
-    result_indices = []
-    points_with_255 = []
-
-    for i in range(N):
-            # Get coordinates of all points with value 255 in the current mask
-            points_with_255.append(np.argwhere(masks[i] == 255))
-
-    for keypoint in keypoints:
-        x, y = keypoint
-        min_distance = float('inf')
-        nearest_mask_index = -1
-
-        for i in range(N):
-            if points_with_255[i].size == 0:
-                # If there are no points with 255 in this mask, skip it
-                continue
-
-            # Calculate the squared Euclidean distance to the keypoint for each point with value 255
-            distances = np.sqrt((points_with_255[i][:, 0] - y) ** 2 + (points_with_255[i][:, 1] - x) ** 2)
-
-            # Find the minimum distance in this mask
-            min_dist_in_mask = np.min(distances)
-
-            # Update the nearest mask and distance if the current one is closer
-            if min_dist_in_mask < min_distance:
-                min_distance = min_dist_in_mask
-                nearest_mask_index = i
-
-        # Store the nearest mask index for the current keypoint
-        if min_distance < 2.0:
-            result_indices.append(nearest_mask_index)
-        else:
-            result_indices.append(-1)
-
-    return np.array(result_indices)
-
 # def find_nearest_masks_for_keypoints(masks, keypoints):
 #     N = masks.shape[0]
 #     result_indices = []
+#     points_with_255 = []
 
-#     kpts = np.array(keypoints)
-#     yx = kpts[:, [1, 0]]  # (y, x) points
-
-#     # Build a KDTree for the 255 points in each mask
-#     trees = []
 #     for i in range(N):
-#         pts_255 = np.argwhere(masks[i] == 255)
-#         if pts_255.shape[0] > 0:
-#             trees.append(KDTree(pts_255))
-#         else:
-#             trees.append(None)
+#             # Get coordinates of all points with value 255 in the current mask
+#             points_with_255.append(np.argwhere(masks[i] == 255))
 
-#     # For each keypoint, query all KD trees to find the nearest mask
-#     for pt in yx:
+#     for keypoint in keypoints:
+#         x, y = keypoint
 #         min_distance = float('inf')
 #         nearest_mask_index = -1
-#         for i, tree in enumerate(trees):
-#             if tree is None:
+
+#         for i in range(N):
+#             if points_with_255[i].size == 0:
+#                 # If there are no points with 255 in this mask, skip it
 #                 continue
-#             dist, _ = tree.query(pt, k=1, distance_upper_bound=2.0)
-#             if dist < min_distance:
-#                 min_distance = dist
+
+#             # Calculate the squared Euclidean distance to the keypoint for each point with value 255
+#             distances = np.sqrt((points_with_255[i][:, 0] - y) ** 2 + (points_with_255[i][:, 1] - x) ** 2)
+
+#             # Find the minimum distance in this mask
+#             min_dist_in_mask = np.min(distances)
+
+#             # Update the nearest mask and distance if the current one is closer
+#             if min_dist_in_mask < min_distance:
+#                 min_distance = min_dist_in_mask
 #                 nearest_mask_index = i
+
+#         # Store the nearest mask index for the current keypoint
 #         if min_distance < 2.0:
 #             result_indices.append(nearest_mask_index)
 #         else:
 #             result_indices.append(-1)
 
 #     return np.array(result_indices)
+
+def find_nearest_masks_for_keypoints_vectorized(masks, keypoints, threshold=2.0):
+    # masks: (N, H, W) torch.uint8 or torch.float32 (CUDA)
+    # keypoints: (M, 2) torch.float32 (CUDA), columns [x, y]
+
+    N, H, W = masks.shape
+    device = masks.device
+    points_list, mask_ids = [], []
+
+    for i in range(N):
+        # Get pixel coordinates (y, x) where mask==255
+        points = torch.nonzero(masks[i] == 255, as_tuple=False).to(torch.float32)
+        if points.numel() == 0:
+            continue
+        points_list.append(points)
+        mask_ids.append(torch.full((points.size(0),), i, dtype=torch.long, device=device))
+
+    if not points_list:  # If all masks are empty, return -1s
+        return torch.full((keypoints.size(0),), -1, dtype=torch.int64, device='cpu')
+
+    all_points = torch.cat(points_list, dim=0)   # shape (P, 2)
+    all_mask_ids = torch.cat(mask_ids, dim=0)    # shape (P, )
+
+    # x=col, y=row in all_points. Flip order for x,y
+    all_points_xy = all_points[:, [1, 0]]
+
+    # Compute distances: (M, P)
+    dists_sq = torch.cdist(keypoints, all_points_xy, p=2).pow(2)
+
+    min_dists_sq, best_idx = dists_sq.min(dim=1)
+    nearest_mask_ids = all_mask_ids[best_idx]  # shape (M, )
+
+    # Apply threshold
+    nearest_mask_ids[min_dists_sq > threshold] = -1
+
+    return nearest_mask_ids.cpu()  # numpy() if you need it as NumPy array
 
 class SuperPoint(nn.Module):
     """SuperPoint Convolutional Detector and Descriptor
@@ -310,10 +313,11 @@ class SuperPoint(nn.Module):
 
         self.semenc = Encoder().to(self.device)
         self.semenc.encoder.load_state_dict(self.encdec.encoder.state_dict())
+        self.semenc = torch.compile(self.semenc)
 
         print('Loaded Semantic Encoder model')
         #'''
-    def forward(self, data, masks):
+    def forward(self, data):
         """ Compute keypoints, scores, descriptors for image """
         # Shared Encoder
         x = self.relu(self.conv1a(data['image']))
@@ -338,99 +342,220 @@ class SuperPoint(nn.Module):
         scores = simple_nms(scores, self.config['nms_radius'])
 
         # Extract keypoints
-        keypoints = [
-            torch.nonzero(s > self.config['keypoint_threshold'])
-            for s in scores]
-        scores = [s[tuple(k.t())] for s, k in zip(scores, keypoints)]
+        # keypoints = [
+        #     torch.nonzero(s > self.config['keypoint_threshold'])
+        #     for s in scores]
+        # scores = [s[tuple(k.t())] for s, k in zip(scores, keypoints)]
+        mask = scores > self.config['keypoint_threshold'] # (B, H, W) bool
+        keypoints = mask.nonzero(as_tuple=False) # (N, 3): [batch, y, x]
+        scores = scores[keypoints[:,0], keypoints[:,1], keypoints[:,2]]  # (N,)
+        keypoints = keypoints[:,1:]
 
         # Discard keypoints near the image borders
-        keypoints, scores = list(zip(*[
-            remove_borders(k, s, self.config['remove_borders'], h*8, w*8)
-            for k, s in zip(keypoints, scores)]))
+        # keypoints, scores = list(zip(*[
+        #     remove_borders(k, s, self.config['remove_borders'], h*8, w*8)
+        #     for k, s in zip(keypoints, scores)]))
+        border = self.config['remove_borders']
+        y_dim, x_dim = keypoints[:,0], keypoints[:,1]  # (N,)
+        mask_y = (y_dim >= border) & (y_dim < (h*8) - border)
+        mask_x = (x_dim >= border) & (x_dim < (w*8) - border)
+        mask = mask_y & mask_x                 # (N,)
+        keypoints = keypoints[mask]
+        scores = scores[mask]
 
         # Keep the k keypoints with highest score
         if self.config['max_keypoints'] >= 0:
-            keypoints, scores = list(zip(*[
-                top_k_keypoints(k, s, self.config['max_keypoints'])
-                for k, s in zip(keypoints, scores)]))
+            scores, indices = torch.topk(scores, self.config['max_keypoints'])
+            keypoints = keypoints[indices]
+            # keypoints, scores = list(zip(*[
+            #     top_k_keypoints(k, s, self.config['max_keypoints'])
+            #     for k, s in zip(keypoints, scores)]))
 
         # Convert (h, w) to (x, y)
-        keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+        # keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+        keypoints = torch.flip(keypoints, [1]).float()
 
         # Compute the dense descriptors
         cDa = self.relu(self.convDa(x))
         descriptors = self.convDb(cDa)
         descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
-        descriptors = [sample_descriptors(k[None], d[None], 8)[0]
-               for k, d in zip(keypoints, descriptors)]
+        descriptors = sample_descriptors(keypoints, descriptors, 8)
+        # descriptors = descriptors[0, :, 0].unsqueeze(1)
+        # descriptors = [sample_descriptors(k[None], d[None], 8)[0]
+        #     for k, d in zip([keypoints], descriptors)]
+
+        # Put in seperate function
 
         #Modified to fit semantics from here
-        if masks is not None:
-            mask_indexes = find_nearest_masks_for_keypoints(masks, keypoints[0].cpu().numpy())
+        # if masks is not None:
+        #     mask_indexes = find_nearest_masks_for_keypoints(masks, keypoints.cpu().numpy())
 
-            semantic_descriptors = []
-            for idx, desc in enumerate(descriptors[0].T):
-                #'''
-                if mask_indexes[idx]>= 0:
-                    #desc = desc.to(self.device)
-                    #reduced_desc = self.LinearEncoder(desc)
-                    ##reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
-                    #reduced_desc = reduced_desc.cpu().numpy()
+        #     semantic_descriptors = []
+        #     for idx, desc in enumerate(descriptors[0].T):
+        #         #'''
+        #         if mask_indexes[idx]>= 0:
+        #             #desc = desc.to(self.device)
+        #             #reduced_desc = self.LinearEncoder(desc)
+        #             ##reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
+        #             #reduced_desc = reduced_desc.cpu().numpy()
 
-                    sem_background = masks[mask_indexes[idx]]
-                    sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
-                    sem_background = torch.nn.functional.interpolate(
-                                        sem_background.unsqueeze(0).unsqueeze(0),
-                                        size=(128, 128),  # Adjust to expected input size
-                                        mode='bilinear',
-                                        align_corners=False
-                                    )
-                    encoded = self.semenc(sem_background)
-                    #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
-                    bottleneck_vector = (encoded.cpu().numpy())
-                    #semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
-                    semantic_descriptors.append(desc.cpu().numpy()+bottleneck_vector[0])
+        #             sem_background = masks[mask_indexes[idx]]
+        #             sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
+        #             sem_background = torch.nn.functional.interpolate(
+        #                                 sem_background.unsqueeze(0).unsqueeze(0),
+        #                                 size=(128, 128),  # Adjust to expected input size
+        #                                 mode='bilinear',
+        #                                 align_corners=False
+        #                             )
+        #             encoded = self.semenc(sem_background)
+        #             #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
+        #             bottleneck_vector = (encoded.cpu().numpy())
+        #             #semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
+        #             semantic_descriptors.append(desc.cpu().numpy()+bottleneck_vector[0])
 
 
-                else:
-                #'''
-                    semantic_descriptors.append(desc.cpu().numpy())
-                    '''
-                    desc = desc.to(self.device)
-                    reduced_desc = self.LinearEncoder(desc)
-                    #reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
-                    reduced_desc = reduced_desc.cpu().numpy()
+        #         else:
+        #         #'''
+        #             semantic_descriptors.append(desc.cpu().numpy())
+        #             '''
+        #             desc = desc.to(self.device)
+        #             reduced_desc = self.LinearEncoder(desc)
+        #             #reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
+        #             reduced_desc = reduced_desc.cpu().numpy()
 
-                    sem_background = np.any(masks, axis=0).astype(np.uint8)
-                    sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
-                    sem_background = torch.nn.functional.interpolate(
-                                        sem_background.unsqueeze(0).unsqueeze(0),
-                                        size=(128, 128),  # Adjust to expected input size
-                                        mode='bilinear',
-                                        align_corners=False
-                                    )
-                    encoded = self.semenc(sem_background)
-                    #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
-                    bottleneck_vector = (encoded.cpu().numpy())
-                    semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
-                    '''
+        #             sem_background = np.any(masks, axis=0).astype(np.uint8)
+        #             sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
+        #             sem_background = torch.nn.functional.interpolate(
+        #                                 sem_background.unsqueeze(0).unsqueeze(0),
+        #                                 size=(128, 128),  # Adjust to expected input size
+        #                                 mode='bilinear',
+        #                                 align_corners=False
+        #                             )
+        #             encoded = self.semenc(sem_background)
+        #             #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
+        #             bottleneck_vector = (encoded.cpu().numpy())
+        #             semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
+        #             '''
 
-        else:
-            mask_indexes = np.full((len(keypoints[0])), -1, dtype=np.int64)
-            semantic_descriptors = descriptors[0].T.cpu()
+        # else:
+        #     mask_indexes = np.full((len(keypoints)), -1, dtype=np.int64)
+        #     semantic_descriptors = descriptors[0].T.cpu()
 
-        descriptors = np.array(semantic_descriptors,np.float32)
-        descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
-        #descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).unsqueeze(0) #for branched
-        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
-        mask_indexes = torch.tensor(mask_indexes, dtype=torch.int64).unsqueeze(0)
+        # descriptors = np.array(semantic_descriptors,np.float32)
+        # descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
+        # #descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).unsqueeze(0) #for branched
+        # descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+        # mask_indexes = torch.tensor(mask_indexes, dtype=torch.int64).unsqueeze(0)
 
         #Modified to fit semantics until here
         #mask_indexes = torch.tensor(mask_indexes, dtype=torch.int64).unsqueeze(0).to(self.device)
 
         return {
-            'keypoints': keypoints,
-            'scores': scores,
+            'keypoints': [keypoints],
+            'scores': [scores],
+            'descriptors': descriptors,
+            # 'indexes' : mask_indexes,
+        }
+
+    def compute_semantic_descriptors(self, pred, masks):
+        descriptors = pred["descriptors"][0].clone()
+        if masks is not None:
+            mask_indexes = find_nearest_masks_for_keypoints_vectorized(masks, pred["keypoints"][0])
+            mmask = mask_indexes >= 0
+            mask_indexes_masked = mask_indexes[mmask]
+            # descriptors_masked = pred["descriptors"][0][:, mmask]
+            masks_masked = masks[mask_indexes_masked]
+
+            m_t = masks_masked.to(torch.float32)
+            m_t_i = torch.nn.functional.interpolate(
+                m_t.unsqueeze(0),
+                size=(128, 128),
+                mode="bilinear",
+                align_corners=False
+            ).permute(1, 0, 2, 3)
+            # m_t_i_batched = m_t_i[:, :50]          # shape: (1, 50, 128, 128)
+            # m_t_i_batched = m_t_i_batched.permute(1, 0, 2, 3)  # shape: (50, 1, 128, 128)
+
+            outputs = []
+            N = m_t_i.shape[0]
+            batch_size = 50
+            for start in range(0, N, batch_size):
+                end = min(start + batch_size, N)
+                batch = m_t_i[start:end]
+                with torch.inference_mode():
+                    encoded = self.semenc(batch)
+                    outputs.append(encoded)
+
+            bottleneck_vector = torch.cat(outputs, dim=0)
+
+            descriptors[:, mmask] += bottleneck_vector.T
+
+            descriptors = descriptors.unsqueeze(0)
+
+            # semantic_descriptors = []
+            # for idx, desc in enumerate(pred["descriptors"][0].T):
+            #     #'''
+            #     if mask_indexes[idx]>= 0:
+            #         #desc = desc.to(self.device)
+            #         #reduced_desc = self.LinearEncoder(desc)
+            #         ##reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
+            #         #reduced_desc = reduced_desc.cpu().numpy()
+
+            #         sem_background = masks[mask_indexes[idx]]
+            #         sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
+            #         sem_background = torch.nn.functional.interpolate(
+            #                             sem_background.unsqueeze(0).unsqueeze(0),
+            #                             size=(128, 128),  # Adjust to expected input size
+            #                             mode='bilinear',
+            #                             align_corners=False
+            #                         )
+            #         with torch.inference_mode():
+            #             encoded = self.semenc(sem_background)
+            #         #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
+            #         bottleneck_vector = (encoded.cpu().numpy())
+            #         #semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
+            #         semantic_descriptors.append(desc.cpu().numpy()+bottleneck_vector[0])
+
+
+            #     else:
+            #     #'''
+            #         semantic_descriptors.append(desc.cpu().numpy())
+            #         '''
+            #         desc = desc.to(self.device)
+            #         reduced_desc = self.LinearEncoder(desc)
+            #         #reduced_desc = torch.nn.functional.normalize(reduced_desc, p=2, dim=0)
+            #         reduced_desc = reduced_desc.cpu().numpy()
+
+            #         sem_background = np.any(masks, axis=0).astype(np.uint8)
+            #         sem_background = torch.tensor(sem_background, dtype=torch.float32).to(self.device)
+            #         sem_background = torch.nn.functional.interpolate(
+            #                             sem_background.unsqueeze(0).unsqueeze(0),
+            #                             size=(128, 128),  # Adjust to expected input size
+            #                             mode='bilinear',
+            #                             align_corners=False
+            #                         )
+            #         encoded = self.semenc(sem_background)
+            #         #encoded = torch.nn.functional.normalize(encoded, p=2, dim=0)
+            #         bottleneck_vector = (encoded.cpu().numpy())
+            #         semantic_descriptors.append(np.concatenate((bottleneck_vector[0],reduced_desc)))
+            #         '''
+
+        else:
+            mask_indexes = np.full((len(pred["keypoints"][0])), -1, dtype=np.int64)
+            semantic_descriptors = pred["descriptors"][0].T.cpu()
+            descriptors = np.array(semantic_descriptors,np.float32)
+            descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
+
+        # descriptors = np.array(semantic_descriptors,np.float32)
+        # descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
+        #descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).unsqueeze(0) #for branched
+        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+        # mask_indexes = torch.tensor(mask_indexes, dtype=torch.int64).unsqueeze(0)
+        mask_indexes = mask_indexes.to(torch.int64).unsqueeze(0)
+
+        return {
+            'keypoints': pred["keypoints"],
+            'scores': pred["scores"],
             'descriptors': descriptors,
             'indexes' : mask_indexes,
         }

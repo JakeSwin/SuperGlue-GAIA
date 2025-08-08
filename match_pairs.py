@@ -50,6 +50,7 @@ import random
 import numpy as np
 import matplotlib.cm as cm
 import torch
+import torch.nn.functional as F
 import cv2
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
@@ -437,14 +438,22 @@ if __name__ == '__main__':
                 result0 = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False, device=0)
                 # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
                 if result0[0].masks is not None:
-                    masks = result0[0].masks.data.cpu().numpy()
-                    #combined_mask = np.any(masks, axis=0).astype(np.uint8)
-                    #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
-                    resized_masks0 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
-                    for j in range(masks.shape[0]):
-                        resized_masks0[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
-                        resized_masks0[j][resized_masks0[j] == 1] = 255
-                        resized_masks0[j][resized_masks0[j] != 255] = 0
+                    # masks = result0[0].masks.data.cpu().numpy()
+                    # resized_masks0 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype) # TODO Do this on gpu to save conversion
+                    # for j in range(masks.shape[0]):
+                    #     resized_masks0[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
+                    #     resized_masks0[j][resized_masks0[j] == 1] = 255
+                    #     resized_masks0[j][resized_masks0[j] != 255] = 0
+                    masks = result0[0].masks.data  # shape: (N, H, W), assumed to be on cuda
+                    # Add channel dimension for interpolate: (N, 1, H, W)
+                    masks = masks.unsqueeze(1).float()  # if not already float, convert (required for interpolate)
+                    # Resize with nearest neighbor: target size (480, 640)
+                    resized_masks0 = F.interpolate(masks, size=(480, 640), mode='nearest')
+                    # Remove channel dim: shape (N, 480, 640)
+                    resized_masks0 = resized_masks0.squeeze(1)
+                    # Binarize and rescale: set all 1s to 255 and others to 0
+                    # If the original mask might have floating point artifacts, threshold first:
+                    resized_masks0 = (resized_masks0 > 0.5).to(torch.uint8) * 255  # shape: (N, 480, 640), values 0 or 255
 
                 # yoloimg = cv2.imread(str(input_dir / name1))
                 # yoloimg = cv2.resize(yoloimg, (640, 640))
@@ -452,14 +461,22 @@ if __name__ == '__main__':
                 result1 = yolo.predict(yoloimg,conf=0.2, classes=[0,4], verbose=False, device=0)
                 # 0-Building 1-Pipe 2-Pole 3-Robot 4-Trunk 5-Vehicle
                 if result1[0].masks is not None:
-                    masks = result1[0].masks.data.cpu().numpy()
-                    #combined_mask = np.any(masks, axis=0).astype(np.uint8)
-                    #masked_img = yoloimg * combined_mask[:,:,np.newaxis]
-                    resized_masks1 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
-                    for j in range(masks.shape[0]):
-                        resized_masks1[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
-                        resized_masks1[j][resized_masks1[j] == 1] = 255
-                        resized_masks1[j][resized_masks1[j] != 255] = 0
+                    # masks = result1[0].masks.data.cpu().numpy()
+                    # resized_masks1 = np.empty((masks.shape[0], 480, 640), dtype=masks.dtype)
+                    # for j in range(masks.shape[0]):
+                    #     resized_masks1[j] = cv2.resize(masks[j], (640, 480), interpolation=cv2.INTER_NEAREST)
+                    #     resized_masks1[j][resized_masks1[j] == 1] = 255
+                    #     resized_masks1[j][resized_masks1[j] != 255] = 0
+                    masks = result1[0].masks.data  # shape: (N, H, W), assumed to be on cuda
+                    # Add channel dimension for interpolate: (N, 1, H, W)
+                    masks = masks.unsqueeze(1).float()  # if not already float, convert (required for interpolate)
+                    # Resize with nearest neighbor: target size (480, 640)
+                    resized_masks1 = F.interpolate(masks, size=(480, 640), mode='nearest')
+                    # Remove channel dim: shape (N, 480, 640)
+                    resized_masks1 = resized_masks1.squeeze(1)
+                    # Binarize and rescale: set all 1s to 255 and others to 0
+                    # If the original mask might have floating point artifacts, threshold first:
+                    resized_masks1 = (resized_masks1 > 0.5).to(torch.uint8) * 255  # shape: (N, 480, 640), values 0 or 255
 
                 timer.update('YOLO')
                 # Added for YOLO END
@@ -591,8 +608,8 @@ if __name__ == '__main__':
                             'epipolar_errors': epi_errs}
                 np.savez(str(eval_path), **out_eval)
 
-                resized_masks0_uint8 = resized_masks0.astype(np.uint8)
-                resized_masks1_uint8 = resized_masks1.astype(np.uint8)
+                # resized_masks0_uint8 = resized_masks0.astype(np.uint8)
+                # resized_masks1_uint8 = resized_masks1.astype(np.uint8)
 
                 # For a (3, 3) rotation matrix:
                 rotation_matrix = T_0to1[:3, :3]
@@ -610,7 +627,7 @@ if __name__ == '__main__':
                 # np.save('K0.npy', K0)
                 # np.save('resized_masks1_uint8.npy', resized_masks1_uint8)
 
-                iou, iou_indexes = project_images_torch(resized_masks0_uint8, rotation_matrix[0], translation_vec[0], K0, resized_masks1_uint8)
+                iou, iou_indexes = project_images_torch(resized_masks0, rotation_matrix[0], translation_vec[0], K0, resized_masks1)
                 stat = compute_sem_match_stat(kpts0, kpts1,indexes0, indexes1, iou_indexes, matches)
                 sem2sem.append(stat['semantics_to_semantics_pct'])
                 bg2bg.append(stat['background_to_background_pct'])

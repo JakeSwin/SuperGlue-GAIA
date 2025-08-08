@@ -377,8 +377,8 @@ def project_images_torch(result0, rotation_matrix, translation_vec, camera_matri
     IOU_THRESHOLD = 0.1
     # m0_exp = result0[0].masks.data.unsqueeze(1)
     # m1_exp = result1[0].masks.data.unsqueeze(0)
-    m0_exp = torch.from_numpy(result0).float().unsqueeze(1).to("cuda") # torch.Size([27, 1, 480, 640])
-    m1_exp = torch.from_numpy(result1).float().unsqueeze(0).to("cuda") # torch.Size([1, 31, 480, 640])
+    m0_exp = result0.float().unsqueeze(1).to("cuda") # torch.Size([27, 1, 480, 640])
+    m1_exp = result1.float().unsqueeze(0).to("cuda") # torch.Size([1, 31, 480, 640])
     # May need to check the batch size of these matrixs and copy them only if there is one
     # then again it could just be that only 1 is sent each time and that is not needed
     rotation_matrix = torch.from_numpy(rotation_matrix).to("cuda") # torch.Size([3, 3])
