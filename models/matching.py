@@ -39,6 +39,8 @@
 # %AUTHORS_END%
 # --------------------------------------------------------------------*/
 # %BANNER_END%
+import csv
+import time
 import os
 import torch
 import numpy as np
@@ -107,6 +109,7 @@ class Matching(torch.nn.Module):
         self.sift = SIFT()
         self.superglue = SuperGlue(config.get('superglue', {}))
         self.lightglue = LightGlue(features='sift').eval().cuda()  # load the matcher
+        self.iobuffers = config.get('iobuffers', {})
 
     def forward(self, data, sem_background0=None, sem_background1=None):
         """ Run SuperPoint (optionally) and SuperGlue
@@ -120,6 +123,7 @@ class Matching(torch.nn.Module):
         if 'keypoints0' not in data:
             with torch.inference_mode():
                 # pred0 = self.compiled_superpoint(data['image0'])
+                start_time_keypoint_extraction = time.time()
                 self.inputs[0].host = data["image0"].numpy()
                 do_inference(self.context, self.engine, self.bindings, self.inputs, self.outputs, self.stream)
                 pred0 = {}
@@ -133,7 +137,11 @@ class Matching(torch.nn.Module):
                         out_name = name.split("_")[0]
                         N = pred0[name].item()
                         pred0[out_name] = pred0[out_name][:N].reshape(output_tensor_shapes[out_name])
-            pred0 = self.superpoint.compute_semantic_descriptors(pred0, sem_background0)
+                end_time_keypoint_extraction = time.time()
+                elapsed_time_keypoint_extraction = end_time_keypoint_extraction - start_time_keypoint_extraction
+                writer = csv.writer(self.iobuffers["keypoint_extraction"])
+                writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time_keypoint_extraction])
+            pred0 = self.superpoint.compute_semantic_descriptors(pred0, sem_background0, self.iobuffers)
             #pred0 = self.orb({'image': data['gs0']}, sem_background0)
             #pred0 = self.sift({'image': data['gs0']}, sem_background0)
             #pred0 = self.sift.extract(data['rgb0'], sem_background0)
@@ -142,6 +150,7 @@ class Matching(torch.nn.Module):
         if 'keypoints1' not in data:
             with torch.inference_mode():
                 # pred1 = self.compiled_superpoint(data['image1'])
+                start_time_keypoint_extraction = time.time()
                 self.inputs[0].host = data["image1"].numpy()
                 do_inference(self.context, self.engine, self.bindings, self.inputs, self.outputs, self.stream)
                 pred1 = {}
@@ -155,7 +164,11 @@ class Matching(torch.nn.Module):
                         out_name = name.split("_")[0]
                         N = pred1[name].item()
                         pred1[out_name] = pred1[out_name][:N].reshape(output_tensor_shapes[out_name])
-            pred1 = self.superpoint.compute_semantic_descriptors(pred1, sem_background1)
+                end_time_keypoint_extraction = time.time()
+                elapsed_time_keypoint_extraction = end_time_keypoint_extraction - start_time_keypoint_extraction
+                writer = csv.writer(self.iobuffers["keypoint_extraction"])
+                writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time_keypoint_extraction])
+            pred1 = self.superpoint.compute_semantic_descriptors(pred1, sem_background1, self.iobuffers)
             #pred1 = self.orb({'image': data['gs1']}, sem_background1)
             #pred1 = self.sift({'image': data['gs1']}, sem_background1)
             #pred1 = self.sift.extract(data['rgb1'], sem_background1)
@@ -174,7 +187,14 @@ class Matching(torch.nn.Module):
         #data['scores1'] = data.pop('keypoint_scores1') # For siftn LG
         #data['descriptors0'] = pred0['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)  # For sift
         #data['descriptors1'] = pred1['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)  # For sift
+
+        start_time = time.time()
         pred = {**pred, **self.superglue(data)}
+        end_time = time.time()
+
+        elapsed_time = end_time - start_time
+        writer = csv.writer(self.iobuffers["superglue_matching"])
+        writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time])
 
         # LightGlue with SuperPoint
         #pred0['descriptors'] = pred0['descriptors'].squeeze(0).transpose(0, 1).unsqueeze(0)

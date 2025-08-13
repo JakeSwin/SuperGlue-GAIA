@@ -58,6 +58,10 @@ import seaborn as sns
 import pandas as pd
 from sklearn.metrics import confusion_matrix
 
+import csv
+import time
+from io import StringIO
+
 from torch.utils.data import DataLoader
 from ultralytics.models import sam
 
@@ -206,6 +210,11 @@ if __name__ == '__main__':
                 'All pairs should have ground truth info for evaluation.'
                 'File \"{}\" needs 38 valid entries per row'.format(opt.input_pairs))
 
+    panoptic_segmentation_yolo_buffer = StringIO()
+    superglue_matching_buffer = StringIO()
+    keypoint_extraction_buffer = StringIO()
+    ksi_keypoint_semantic_integration_buffer = StringIO()
+    semantic_encoder_buffer = StringIO()
 
     # Load the SuperPoint and SuperGlue models.
     device = 'cuda' if torch.cuda.is_available() and not opt.force_cpu else 'cpu'
@@ -220,6 +229,12 @@ if __name__ == '__main__':
             'weights': opt.superglue,
             'sinkhorn_iterations': opt.sinkhorn_iterations,
             'match_threshold': opt.match_threshold,
+        },
+        'iobuffers': {
+            "superglue_matching": superglue_matching_buffer,
+            "keypoint_extraction": keypoint_extraction_buffer,
+            "ksi_keypoint_semantic_integration": ksi_keypoint_semantic_integration_buffer,
+            "semantic_encoder": semantic_encoder_buffer
         }
     }
     matching = Matching(config).eval().to(device)
@@ -453,6 +468,7 @@ if __name__ == '__main__':
                 exit(1)
             timer.update('load_image')
 
+            start_time = time.time()
             if do_match:
                 # Perform the matching.
                 #'''
@@ -505,8 +521,14 @@ if __name__ == '__main__':
                     # Binarize and rescale: set all 1s to 255 and others to 0
                     # If the original mask might have floating point artifacts, threshold first:
                     resized_masks1 = (resized_masks1 > 0.5).to(torch.uint8) * 255  # shape: (N, 480, 640), values 0 or 255
+                end_time = time.time()
 
-                timer.update('YOLO')
+                elapsed_time = end_time - start_time
+
+                writer = csv.writer(panoptic_segmentation_yolo_buffer)
+                writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time])
+
+                # timer.update('YOLO')
                 # Added for YOLO END
                 #Note: Utils line 428 was added to set z=0.0
                 #'''
@@ -789,6 +811,22 @@ if __name__ == '__main__':
     # Save the DataFrame as a CSV file
     csv_filename = f'{opt.month}_{opt.desc}_semantic_match_statistics.csv'
     df.to_csv(csv_filename, index=False)
+
+    csv_content = panoptic_segmentation_yolo_buffer.getvalue()
+    with open('timer_panopitic_segmentation_yolo.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write(csv_content)
+    csv_content = superglue_matching_buffer.getvalue()
+    with open('timer_superglue_matching.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write(csv_content)
+    csv_content = keypoint_extraction_buffer.getvalue()
+    with open('timer_keypoint_extraction.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write(csv_content)
+    csv_content = ksi_keypoint_semantic_integration_buffer.getvalue()
+    with open('timer_ksi_keypoint_semantic_integration.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write(csv_content)
+    csv_content = semantic_encoder_buffer.getvalue()
+    with open('timer_semantic_encoder.csv', 'w', newline='', encoding='utf-8') as f:
+        f.write(csv_content)
 
     #'''
     if opt.eval:

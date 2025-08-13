@@ -84,7 +84,7 @@ def allocate_buffers(engine: trt.ICudaEngine, profile_idx: int = None):
             elif binding == "scores":
                 binding_memory = HostDeviceMem(5000, dtype)
             elif binding == "descriptors":
-                binding_memory = HostDeviceMem(300000, dtype)
+                binding_memory = HostDeviceMem(600000, dtype)
             else:
                 binding_memory = HostDeviceMem(size, dtype)
         except TypeError:  # For unsupported types

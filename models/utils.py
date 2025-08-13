@@ -374,6 +374,13 @@ def project_images_fast(resized_masks0_uint8, rotation_matrix, translation_vec, 
     return fast_util.project_images(resized_masks0_uint8, rotation_matrix, translation_vec, K0, resized_masks1_uint8)
 
 def project_images_torch(result0, rotation_matrix, translation_vec, camera_matrix, result1):
+    if result0 is None:
+        print("Warning: result0 is None, skipping processing.")
+        return [], []  # Or some other default value indicating no operation was performed
+    if result1 is None:
+        print("Warning: result1 is None, skipping processing.")
+        return [], []  # Or some other default value indicating no operation was performed
+
     IOU_THRESHOLD = 0.1
     # m0_exp = result0[0].masks.data.unsqueeze(1)
     # m1_exp = result1[0].masks.data.unsqueeze(0)

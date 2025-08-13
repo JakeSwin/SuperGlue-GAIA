@@ -39,7 +39,8 @@
 # %AUTHORS_END%
 # --------------------------------------------------------------------*/
 # %BANNER_END%
-
+import csv
+import time
 from pathlib import Path
 import torch
 from torch import nn
@@ -480,40 +481,52 @@ class SuperPoint(nn.Module):
             # 'indexes' : mask_indexes,
         }
 
-    def compute_semantic_descriptors(self, pred, masks):
+    def compute_semantic_descriptors(self, pred, masks, iobuffers):
+        start_time_ksi_keypoint_semantic_integration = time.time()
         descriptors = torch.tensor(pred["descriptors"][0]).cuda()
         keypoints = torch.tensor([pred["keypoints"]]).cuda()
         scores = torch.tensor([pred["scores"]]).cuda()
         if masks is not None:
             mask_indexes = find_nearest_masks_for_keypoints_vectorized(masks, keypoints[0])
+
+            start_time_semantic_encoder = time.time()
+
             mmask = mask_indexes >= 0
-            mask_indexes_masked = mask_indexes[mmask]
-            # descriptors_masked = pred["descriptors"][0][:, mmask]
-            masks_masked = masks[mask_indexes_masked]
 
-            m_t = masks_masked.to(torch.float32)
-            m_t_i = torch.nn.functional.interpolate(
-                m_t.unsqueeze(0),
-                size=(128, 128),
-                mode="bilinear",
-                align_corners=False
-            ).permute(1, 0, 2, 3)
-            # m_t_i_batched = m_t_i[:, :50]          # shape: (1, 50, 128, 128)
-            # m_t_i_batched = m_t_i_batched.permute(1, 0, 2, 3)  # shape: (50, 1, 128, 128)
+            if torch.any(mmask):
+                mask_indexes_masked = mask_indexes[mmask]
+                # descriptors_masked = pred["descriptors"][0][:, mmask]
+                masks_masked = masks[mask_indexes_masked]
 
-            outputs = []
-            N = m_t_i.shape[0]
-            batch_size = 50
-            for start in range(0, N, batch_size):
-                end = min(start + batch_size, N)
-                batch = m_t_i[start:end]
-                with torch.inference_mode():
-                    encoded = self.semenc(batch)
-                    outputs.append(encoded)
+                m_t = masks_masked.to(torch.float32)
+                m_t_i = torch.nn.functional.interpolate(
+                    m_t.unsqueeze(0),
+                    size=(128, 128),
+                    mode="bilinear",
+                    align_corners=False
+                ).permute(1, 0, 2, 3)
+                # m_t_i_batched = m_t_i[:, :50]          # shape: (1, 50, 128, 128)
+                # m_t_i_batched = m_t_i_batched.permute(1, 0, 2, 3)  # shape: (50, 1, 128, 128)
 
-            bottleneck_vector = torch.cat(outputs, dim=0)
+                outputs = []
+                N = m_t_i.shape[0]
+                batch_size = 50
+                for start in range(0, N, batch_size):
+                    end = min(start + batch_size, N)
+                    batch = m_t_i[start:end]
+                    with torch.inference_mode():
+                        encoded = self.semenc(batch)
+                        outputs.append(encoded)
 
-            descriptors[:, mmask] += bottleneck_vector.T
+                bottleneck_vector = torch.cat(outputs, dim=0)
+
+                descriptors[:, mmask] += bottleneck_vector.T
+
+            end_time_semantic_encoder = time.time()
+
+            elapsed_time_semantic_encoder = end_time_semantic_encoder - start_time_semantic_encoder
+            writer = csv.writer(iobuffers["semantic_encoder"])
+            writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time_semantic_encoder])
 
             descriptors = descriptors.unsqueeze(0)
 
@@ -577,6 +590,13 @@ class SuperPoint(nn.Module):
         descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
         # mask_indexes = torch.tensor(mask_indexes, dtype=torch.int64).unsqueeze(0)
         mask_indexes = mask_indexes.to(torch.int64).unsqueeze(0)
+
+        end_time_ksi_keypoint_semantic_integration = time.time()
+
+        elapsed_time_ksi_keypoint_semantic_integration = end_time_ksi_keypoint_semantic_integration - start_time_ksi_keypoint_semantic_integration
+
+        writer = csv.writer(iobuffers["ksi_keypoint_semantic_integration"])
+        writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), elapsed_time_ksi_keypoint_semantic_integration])
 
         return {
             'keypoints': keypoints,
