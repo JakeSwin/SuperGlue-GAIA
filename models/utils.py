@@ -437,7 +437,7 @@ def project_images_torch(result0, rotation_matrix, translation_vec, camera_matri
     sorted_vals = sorted_vals.cpu().numpy()
     sorted_indices = sorted_indices.cpu().numpy()
 
-    # best_ious = best_ious
+    # best_ious = best_ious.cpu().numpy()
 
     used_indexs = []
     best_idxs = [-1] * len(m0_exp)

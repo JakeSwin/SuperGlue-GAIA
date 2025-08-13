@@ -28,6 +28,8 @@ class ImagePairDataset(Dataset):
         # Load base images with no modifications
         base_image0 = cv2.imread(str(self.input_dir / name0))
         base_image1 = cv2.imread(str(self.input_dir / name1))
+        depth0 = cv2.imread(str(self.input_dir).replace("rgb", "depth")+"/"+name0.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
+        depth1 = cv2.imread(str(self.input_dir).replace("rgb", "depth")+"/"+name1.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
         # Resize images for yolo prediction
         yoloimg0 = cv2.resize(base_image0, (640, 640))
         yoloimg1 = cv2.resize(base_image1, (640, 640))
@@ -61,4 +63,4 @@ class ImagePairDataset(Dataset):
 
         # Need to convert inp0-1 and rgb0-1 to gpu tensors after batch is pulled
 
-        return self.pairs[idx], (image0, image1), (inp0, inp1), (scales0, scales1), (rgb0, rgb1), (yoloimg0, yoloimg1)
+        return self.pairs[idx], (image0, image1), (inp0, inp1), (scales0, scales1), (rgb0, rgb1), (yoloimg0, yoloimg1), (depth0, depth1)
