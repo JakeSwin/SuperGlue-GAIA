@@ -434,18 +434,18 @@ def project_images_torch(result0, rotation_matrix, translation_vec, camera_matri
     best_ious, _ = iou_torch.max(dim=1)
 
     sorted_vals, sorted_indices = torch.sort(iou_torch, dim=1, descending=True)
-    # sorted_vals = sorted_vals.cpu().numpy()
-    # sorted_indices = sorted_indices.cpu().numpy()
+    sorted_vals = sorted_vals.cpu().numpy()
+    sorted_indices = sorted_indices.cpu().numpy()
 
-    best_ious = best_ious.cpu().numpy()
+    # best_ious = best_ious.cpu().numpy()
 
     used_indexs = []
     best_idxs = [-1] * len(m0_exp)
 
     for x in range(m0.shape[0]):
         for y in range(m1.shape[1]):
-            current_iou = sorted_vals[x][y].item()
-            current_idx = sorted_indices[x][y].item()
+            current_iou = sorted_vals[x][y]
+            current_idx = sorted_indices[x][y]
             if current_idx not in used_indexs and current_iou > IOU_THRESHOLD:
                 best_idxs[x] = current_idx
                 used_indexs.append(current_idx)

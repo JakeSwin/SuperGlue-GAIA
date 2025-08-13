@@ -64,7 +64,7 @@ from ultralytics.models import sam
 from models.matching import Matching
 from models.utils import (compute_pose_error, compute_epipolar_error,
                           estimate_pose, estimate_pose_3d, estimate_scale, make_matching_plot,
-                          error_colormap, AverageTimer, pose_auc, plot_3d_vectors, project_images_torch, read_image, read_rgb_image,
+                          error_colormap, AverageTimer, make_matching_plot_fast, pose_auc, plot_3d_vectors, project_images_torch, read_image, read_rgb_image,
                           rotate_intrinsics, rotate_pose_inplane,
                           scale_intrinsics, frame2tensor,project_images, compute_sem_match_stat, project_images_fast)
 from models.LGutils import load_image_LG
@@ -235,6 +235,7 @@ if __name__ == '__main__':
               'directory \"{}\"'.format(output_dir))
 
     conf_mat_queue = Queue()
+    matching_plot_queue = Queue()
 
     def save_confusion_matrix(conf_matrix, title, image_path, cmap='Blues'):
         import matplotlib
@@ -258,8 +259,26 @@ if __name__ == '__main__':
             conf_matrix, title, path, cmap = item
             save_confusion_matrix(conf_matrix, title, path, cmap)
 
-    writer = Process(target=confusion_matrix_writer, args=(conf_mat_queue,))
-    writer.start()
+    def matching_plot_writer(queue):
+        while True:
+            item = queue.get()
+            if item is None: break
+            image0, image1, kpts0, kpts1, \
+            mkpts0, mkpts1, color, text, \
+            path, show_keypoints, opencv_display, \
+            opencv_title, small_text = item
+            make_matching_plot_fast(
+                image0, image1, kpts0, kpts1,
+                mkpts0, mkpts1, color, text,
+                path, show_keypoints, 10,
+                opencv_display, opencv_title, small_text
+            )
+
+    cm_writer_proc = Process(target=confusion_matrix_writer, args=(conf_mat_queue,))
+    cm_writer_proc.start()
+
+    mp_writer_proc = Process(target=matching_plot_writer, args=(matching_plot_queue,))
+    mp_writer_proc.start()
 
     # yolo = YOLO("./models/weights/yolo.pt").to('cpu')
     yolo = YOLO("./models/weights/yolo.pt")
@@ -279,13 +298,15 @@ if __name__ == '__main__':
 
     # for i, pair in enumerate(pairs):
     for batch_idx, batch in enumerate(dataloader):
-        pairs_batch, (image0_batch, image1_batch), (inp0_batch, inp1_batch), (scales0_batch, scales1_batch), (rgb0_batch, rgb1_batch), (yoloimg0_batch, yoloimg1_batch) = batch
+        pairs_batch, (image0_batch, image1_batch), (inp0_batch, inp1_batch), (scales0_batch, scales1_batch), (rgb0_batch, rgb1_batch), (yoloimg0_batch, yoloimg1_batch), (depth0_batch, depth1_batch) = batch
         inp0_batch = inp0_batch.to(device)
         inp1_batch = inp1_batch.to(device)
         rgb0_batch = rgb0_batch.to(device)
         rgb1_batch = rgb1_batch.to(device)
         yoloimg0_batch = yoloimg0_batch.numpy()
         yoloimg1_batch = yoloimg1_batch.numpy()
+        depth0_batch = depth0_batch.numpy()
+        depth1_batch = depth1_batch.numpy()
         for sample_idx in range(len(pairs_batch[0])):
             i = (batch_idx * batch_size) + sample_idx
             # pair = pairs_batch[sample_idx]
@@ -299,6 +320,9 @@ if __name__ == '__main__':
             scales1 = [float(s[sample_idx]) for s in scales1_batch]
             rgb0 = rgb0_batch[sample_idx]
             rgb1 = rgb1_batch[sample_idx]
+
+            depth0 = depth0_batch[sample_idx]
+            depth1 = depth1_batch[sample_idx]
 
             name0, name1 = pair[:2]
             stem0, stem1 = Path(name0).stem, Path(name1).stem
@@ -585,8 +609,8 @@ if __name__ == '__main__':
                 thresh = 1.  # In pixels relative to resized image size.
 
                 # Get depth based pose estimation
-                depth0 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name0.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
-                depth1 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name1.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
+                # depth0 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name0.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
+                # depth1 = cv2.imread(str(input_dir).replace("rgb", "depth")+"/"+name1.replace("color", "depth"),cv2.IMREAD_GRAYSCALE)
                 #ret = estimate_pose_3d(mkpts0, mkpts1, depth0, depth1, K0_original, K1_original, scales0, scales1)
                 #plot_pointcloud_with_rgb(image0,depth0,K0)
 
@@ -679,10 +703,18 @@ if __name__ == '__main__':
                     'Image Pair: {}:{}'.format(stem0, stem1),
                 ]
 
-                make_matching_plot(
-                    image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
-                    text, viz_path, opt.show_keypoints,
-                    opt.fast_viz, opt.opencv_display, 'Matches', small_text)
+                matching_plot_queue.put(
+                    (
+                        image0, image1, kpts0, kpts1, mkpts0, mkpts1,
+                        color, text, viz_path, opt.show_keypoints,
+                        opt.opencv_display, 'Matches', small_text
+                    )
+                )
+
+                # make_matching_plot(
+                #     image0, image1, kpts0, kpts1, mkpts0, mkpts1, color,
+                #     text, viz_path, opt.show_keypoints,
+                #     opt.fast_viz, opt.opencv_display, 'Matches', small_text)
 
                 timer.update('viz_match')
 
@@ -712,11 +744,19 @@ if __name__ == '__main__':
                     'Image Pair: {}:{}'.format(stem0, stem1),
                 ]
 
-                make_matching_plot(
-                    image0, image1, kpts0, kpts1, mkpts0,
-                    mkpts1, color, text, viz_eval_path,
-                    opt.show_keypoints, opt.fast_viz,
-                    opt.opencv_display, 'Relative Pose', small_text)
+                matching_plot_queue.put(
+                    (
+                        image0, image1, kpts0, kpts1, mkpts0, mkpts1,
+                        color, text, viz_path, opt.show_keypoints,
+                        opt.opencv_display, 'Matches', small_text
+                    )
+                )
+
+                # make_matching_plot(
+                #     image0, image1, kpts0, kpts1, mkpts0,
+                #     mkpts1, color, text, viz_eval_path,
+                #     opt.show_keypoints, opt.fast_viz,
+                #     opt.opencv_display, 'Relative Pose', small_text)
 
                 timer.update('viz_eval')
 
