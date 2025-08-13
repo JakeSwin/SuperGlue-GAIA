@@ -66,6 +66,26 @@ def simple_nms(scores, nms_radius: int):
         max_mask = max_mask | (new_max_mask & (~supp_mask))
     return torch.where(max_mask, scores, zeros)
 
+def simple_nms_fix(scores, nms_radius: int):
+    assert nms_radius >= 0
+
+    def max_pool(x):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+            pooled = torch.nn.functional.max_pool2d(x, kernel_size=nms_radius*2+1, stride=1, padding=nms_radius)
+            pooled = pooled.squeeze(1)
+        else:
+            pooled = torch.nn.functional.max_pool2d(x, kernel_size=nms_radius*2+1, stride=1, padding=nms_radius)
+        return pooled
+
+    zeros = torch.zeros_like(scores)
+    max_mask = scores == max_pool(scores)
+    for _ in range(2):
+        supp_mask = max_pool(max_mask.float()) > 0
+        supp_scores = torch.where(supp_mask, zeros, scores)
+        new_max_mask = supp_scores == max_pool(supp_scores)
+        max_mask = max_mask | (new_max_mask & (~supp_mask))
+    return torch.where(max_mask, scores, zeros)
 
 def remove_borders(keypoints, scores, border: int, height: int, width: int):
     """ Removes keypoints too close to the border """
@@ -320,7 +340,7 @@ class SuperPoint(nn.Module):
     def forward(self, data):
         """ Compute keypoints, scores, descriptors for image """
         # Shared Encoder
-        x = self.relu(self.conv1a(data['image']))
+        x = self.relu(self.conv1a(data))
         x = self.relu(self.conv1b(x))
         x = self.pool(x)
         x = self.relu(self.conv2a(x))
@@ -339,7 +359,7 @@ class SuperPoint(nn.Module):
         b, _, h, w = scores.shape
         scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
         scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h*8, w*8)
-        scores = simple_nms(scores, self.config['nms_radius'])
+        scores = simple_nms_fix(scores, self.config['nms_radius'])
 
         # Extract keypoints
         # keypoints = [
@@ -452,15 +472,20 @@ class SuperPoint(nn.Module):
 
         return {
             'keypoints': [keypoints],
+            'keypoints_size': keypoints.numel(),
             'scores': [scores],
+            'scores_size': scores.numel(),
             'descriptors': descriptors,
+            'descriptors_size': descriptors.numel(),
             # 'indexes' : mask_indexes,
         }
 
     def compute_semantic_descriptors(self, pred, masks):
-        descriptors = pred["descriptors"][0].clone()
+        descriptors = torch.tensor(pred["descriptors"][0]).cuda()
+        keypoints = torch.tensor([pred["keypoints"]]).cuda()
+        scores = torch.tensor([pred["scores"]]).cuda()
         if masks is not None:
-            mask_indexes = find_nearest_masks_for_keypoints_vectorized(masks, pred["keypoints"][0])
+            mask_indexes = find_nearest_masks_for_keypoints_vectorized(masks, keypoints[0])
             mmask = mask_indexes >= 0
             mask_indexes_masked = mask_indexes[mmask]
             # descriptors_masked = pred["descriptors"][0][:, mmask]
@@ -541,8 +566,8 @@ class SuperPoint(nn.Module):
             #         '''
 
         else:
-            mask_indexes = np.full((len(pred["keypoints"][0])), -1, dtype=np.int64)
-            semantic_descriptors = pred["descriptors"][0].T.cpu()
+            mask_indexes = torch.tensor(np.full((len(pred["keypoints"])), -1, dtype=np.int64))
+            semantic_descriptors = pred["descriptors"][0].T
             descriptors = np.array(semantic_descriptors,np.float32)
             descriptors = torch.tensor(descriptors, dtype=torch.float32).to(self.device).T.unsqueeze(0) #for unbranched
 
@@ -554,8 +579,8 @@ class SuperPoint(nn.Module):
         mask_indexes = mask_indexes.to(torch.int64).unsqueeze(0)
 
         return {
-            'keypoints': pred["keypoints"],
-            'scores': pred["scores"],
+            'keypoints': keypoints,
+            'scores': scores,
             'descriptors': descriptors,
             'indexes' : mask_indexes,
         }

@@ -73,6 +73,9 @@ from models.loader import ImagePairDataset
 from multiprocessing import Process, Queue
 
 torch.set_grad_enabled(False)
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 
 MONTH = 'september'
 DESC = 'U-256U-256N-FN-SIFT'
@@ -262,7 +265,8 @@ if __name__ == '__main__':
     writer.start()
 
     # yolo = YOLO("./models/weights/yolo.pt").to('cpu')
-    yolo = YOLO("./models/weights/yolo.pt")
+    yolo = YOLO("./models/weights/yolo.engine", task="segment")
+    # yolo.export(format="engine", half=True)
     timer = AverageTimer(newline=True)
     epis = []
 
@@ -280,8 +284,8 @@ if __name__ == '__main__':
     # for i, pair in enumerate(pairs):
     for batch_idx, batch in enumerate(dataloader):
         pairs_batch, (image0_batch, image1_batch), (inp0_batch, inp1_batch), (scales0_batch, scales1_batch), (rgb0_batch, rgb1_batch), (yoloimg0_batch, yoloimg1_batch) = batch
-        inp0_batch = inp0_batch.to(device)
-        inp1_batch = inp1_batch.to(device)
+        inp0_batch = inp0_batch
+        inp1_batch = inp1_batch
         rgb0_batch = rgb0_batch.to(device)
         rgb1_batch = rgb1_batch.to(device)
         yoloimg0_batch = yoloimg0_batch.numpy()
